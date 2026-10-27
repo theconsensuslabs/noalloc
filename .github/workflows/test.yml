@@ -1,0 +1,107 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GO_VERSION: "1.27.0"
+      STATICCHECK_VERSION: "v0.8.2"
+    # Plain git and a downloaded Go, so the workflow needs no outside actions.
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}"
+          git config --local http.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git fetch -q --depth 1 --no-tags origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Install Go
+        run: |
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would change: $unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vendored code
+        run: sh .github/vendor-check.sh
+
+      - name: Vet
+        run: |
+          go vet ./...
+          GOEXPERIMENT=nojsonv2 go vet ./encoding/...
+
+      - name: Staticcheck
+        run: go run "honnef.co/go/tools/cmd/staticcheck@$STATICCHECK_VERSION" ./...
+
+      # The libraries a program links run again under the race detector, and
+      # encoding/json again without the jsonv2 experiment, as encoding/json
+      # differs on invalid UTF-8 between the two.
+      - name: Test
+        run: |
+          go test ./...
+          go test -race ./alloctest/... ./bounded/... ./encoding/... ./html/... ./net/...
+          GOEXPERIMENT=nojsonv2 go test ./encoding/...
+
+      # 386 runs natively on the amd64 runner, so the libraries' suites run
+      # again with a 32-bit int.
+      - name: Test with a 32-bit int
+        run: GOARCH=386 go test ./alloctest/... ./bounded/... ./encoding/... ./html/... ./net/...
+
+      - name: Generated code
+        run: |
+          (cd encoding/json/internal/gentest && go generate)
+          changed="$(git status --porcelain -- encoding/json/internal/gentest)"
+          if [ -n "$changed" ]; then
+            echo "go generate in encoding/json/internal/gentest changes: $changed" >&2
+            git diff -- encoding/json/internal/gentest >&2
+            exit 1
+          fi
+
+  # Each fuzz target, briefly, on every change; fuzz.yml fuzzes longer
+  # nightly. A plain go test above already runs each target's seeds and the
+  # inputs saved under testdata/fuzz.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GO_VERSION: "1.27.0"
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}"
+          git config --local http.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git fetch -q --depth 1 --no-tags origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Install Go
+        run: |
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
+      - name: Fuzz
+        run: sh .github/fuzz.sh 20s

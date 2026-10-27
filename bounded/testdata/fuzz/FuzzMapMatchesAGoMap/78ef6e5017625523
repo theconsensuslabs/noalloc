@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('\x04')
+bool(true)
+[]byte("\x00\x01Z79\x01x(")

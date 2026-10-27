@@ -1,0 +1,36 @@
+--- a/atof.go
++++ b/atof.go
+@@ -555,7 +555,7 @@
+ 	if exp > maxExp { // infinity and range error
+ 		mantissa = 1 << flt.mantbits
+ 		exp = maxExp + 1
+-		err = ErrRange
++		err = errRange
+ 	}
+ 
+ 	bits := mantissa & (1<<flt.mantbits - 1)
+@@ -626,7 +626,7 @@
+ 	b, ovf := dec.floatBits(&float32info)
+ 	f = float32frombits(uint32(b))
+ 	if ovf {
+-		err = ErrRange
++		err = errRange
+ 	}
+ 	return f, n, err
+ }
+@@ -684,7 +684,7 @@
+ 	b, ovf := dec.floatBits(&float64info)
+ 	f = float64frombits(b)
+ 	if ovf {
+-		err = ErrRange
++		err = errRange
+ 	}
+ 	return f, n, err
+ }
+@@ -731,3 +731,6 @@
+ 	}
+ 	return atof64(s)
+ }
++
++// errRange is ErrRange as an error, assigned without converting a constant.
++var errRange error = ErrRange

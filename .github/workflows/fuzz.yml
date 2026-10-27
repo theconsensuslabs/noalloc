@@ -1,0 +1,44 @@
+name: fuzz
+
+# Every fuzz target for longer than test.yml gives each, nightly and on
+# demand. A failure prints the failing input; save it under the target's
+# testdata/fuzz so go test runs it from then on.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "How long to fuzz each target"
+        default: "5m"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GO_VERSION: "1.27.0"
+      FUZZTIME: ${{ inputs.fuzztime || '5m' }}
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}"
+          git config --local http.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git fetch -q --depth 1 --no-tags origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Install Go
+        run: |
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
+      - name: Fuzz
+        run: sh .github/fuzz.sh "$FUZZTIME"

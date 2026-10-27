@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("a stri enz0000000them to00000000000000000000000s of e*0000000")

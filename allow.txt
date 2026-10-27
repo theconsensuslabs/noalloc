@@ -1,0 +1,251 @@
+# Functions outside the module that make no heap allocation, as SSA names
+# them. A line ending in ".*" covers every function whose name starts with
+# what comes before the "*". Add a function only after reading its source:
+# one that returns a new slice, grows a caller's slice, or boxes a value
+# into an interface does not belong here.
+#
+# A line "append: <function>" names one that appends to its first argument
+# and returns it, allocating only to grow it, as the builtin append does. Like
+# append, it is allowed when that slice is reused memory, and reported as a
+# call otherwise. It takes precedence over a ".*" line that covers it.
+
+# Builtin-like and arithmetic packages.
+math.*
+math/bits.*
+unicode.*
+unicode/utf8.*
+sync/atomic.*
+(*sync/atomic.Int32).*
+(*sync/atomic.Int64).*
+(*sync/atomic.Uint32).*
+(*sync/atomic.Uint64).*
+(*sync/atomic.Bool).*
+(*sync/atomic.Pointer[T]).*
+cmp.Compare
+cmp.Or
+cmp.Less
+runtime.KeepAlive
+
+# Locks. Package sync is never entered, so Once.Do counts as one-time setup.
+(*sync.Mutex).*
+(*sync.RWMutex).*
+(*sync.Once).Do
+(*sync.WaitGroup).*
+# TypeOf and TypeFor return the type a value or type argument already has.
+reflect.TypeOf
+reflect.TypeFor
+# Values over memory already there: these read, write, or walk it in place.
+# Interface and String are left off, since both allocate for some kinds.
+reflect.NewAt
+(reflect.Value).Addr
+(reflect.Value).Elem
+(reflect.Value).Index
+(reflect.Value).Int
+(reflect.Value).Kind
+(reflect.Value).IsNil
+(reflect.Value).IsZero
+(reflect.Value).Len
+(reflect.Value).SetIterKey
+(reflect.Value).SetIterValue
+(reflect.Value).SetZero
+(reflect.Value).Uint
+(reflect.Value).UnsafePointer
+(*reflect.MapIter).Next
+(*reflect.MapIter).Reset
+(time.Time).IsZero
+(time.Duration).Seconds
+(net/netip.Addr).IsValid
+# The standard logger formats its header into a buffer from its own pool and
+# writes the line to its writer, which the server sets once at startup.
+log.Default
+(*log.Logger).Output
+# Load reads a hash trie without a lock and makes only its zero value.
+(*sync.Map).Load
+
+# Searching and comparing bytes and strings.
+bytes.Compare
+bytes.Contains
+bytes.ContainsAny
+bytes.ContainsRune
+bytes.Count
+bytes.Cut
+bytes.CutPrefix
+bytes.CutSuffix
+bytes.Equal
+bytes.EqualFold
+bytes.HasPrefix
+bytes.HasSuffix
+bytes.Index
+bytes.IndexAny
+bytes.IndexByte
+bytes.IndexRune
+bytes.LastIndex
+bytes.LastIndexByte
+bytes.TrimLeft
+bytes.TrimPrefix
+bytes.TrimRight
+bytes.TrimSpace
+bytes.TrimSuffix
+(*bytes.Reader).*
+# Cap, Len, and String read a builder's buffer; none copies it.
+(*strings.Builder).Cap
+(*strings.Builder).Len
+(*strings.Builder).String
+strings.Compare
+strings.Contains
+strings.ContainsAny
+strings.ContainsRune
+strings.Count
+strings.Cut
+strings.CutPrefix
+strings.CutSuffix
+strings.EqualFold
+strings.HasPrefix
+strings.HasSuffix
+strings.Index
+strings.IndexAny
+strings.IndexByte
+strings.IndexRune
+strings.LastIndex
+strings.LastIndexByte
+strings.TrimLeft
+strings.TrimPrefix
+strings.TrimRight
+strings.TrimSpace
+strings.TrimSuffix
+net/textproto.TrimString
+(*strings.Reader).*
+(*bytes.Buffer).Cap
+(*bytes.Buffer).Len
+(*bytes.Buffer).Bytes
+(*bytes.Buffer).Reset
+(*regexp.Regexp).String
+(*regexp.Regexp).NumSubexp
+
+# Sorting and searching in place. sort.Slice is not here: it allocates a
+# swapper.
+sort.Search
+sort.SearchInts
+sort.Sort
+sort.Stable
+sort.Ints
+slices.BinarySearch
+slices.BinarySearchFunc
+slices.Compare
+slices.Contains
+slices.ContainsFunc
+slices.Equal
+slices.Index
+slices.IndexFunc
+slices.Max
+slices.Min
+slices.Reverse
+slices.Compact
+slices.Delete
+slices.Sort
+slices.SortFunc
+slices.SortStableFunc
+slices.All
+slices.Backward
+slices.Values
+
+# Formatting into the caller's slice: each appends its digits from a stack
+# array, or a constant's bytes.
+append: strconv.AppendInt
+append: strconv.AppendUint
+append: strconv.AppendBool
+# AppendFloat formats the shortest digits into a stack [32]byte; the fixed
+# precision paths use a stack [24]byte or a decimal the compiler keeps on the
+# stack.
+append: strconv.AppendFloat
+# AppendEncode grows dst by the encoded length and encodes into it; Grow
+# grows its slice only past its capacity; AppendFormat appends the layout's
+# fields one at a time.
+append: (*encoding/base64.Encoding).AppendEncode
+append: slices.Grow
+append: (time.Time).AppendFormat
+append: unicode/utf8.AppendRune
+# AppendQuote quotes into dst; AppendTo writes an address's text into dst.
+append: strconv.AppendQuote
+append: (net/netip.Addr).AppendTo
+append: encoding/binary.AppendUvarint
+append: encoding/binary.AppendVarint
+
+# Fixed-width encoding and hashing.
+(encoding/binary.littleEndian).*
+(encoding/binary.bigEndian).*
+encoding/binary.Uvarint
+encoding/binary.Varint
+encoding/binary.PutUvarint
+encoding/binary.PutVarint
+hash/crc32.Checksum
+# Sum256's digest stays on the stack once New is inlined: 0 allocations a
+# call (server TestATrustCheckAllocatesNothing).
+crypto/sha256.Sum256
+crypto/hmac.Equal
+# Read keeps its buffer on the stack while Reader is the default one: 0
+# allocations a challenge (server TestAChallengeAndAClientClassAllocateNothing).
+crypto/rand.Read
+hash/crc32.Update
+# Comparable's key escapes nowhere: 0 allocations a hash for struct and
+# string keys on Go 1.27. MakeSeed reads the runtime's random source.
+hash/maphash.Comparable
+hash/maphash.MakeSeed
+(*encoding/base64.Encoding).Encode
+(*encoding/base64.Encoding).EncodedLen
+regexp/syntax.EmptyOpContext
+(*regexp/syntax.Inst).MatchRune
+
+# Reads into a buffer the caller passes.
+io.ReadFull
+io.ReadAtLeast
+(*os.File).ReadAt
+(*bufio.Reader).Reset
+(*bufio.Reader).Read
+(*bufio.Reader).ReadByte
+(*bufio.Reader).Buffered
+(*bufio.Reader).Discard
+(*bufio.Reader).Peek
+
+# Contexts: reading one allocates nothing past Done's channel, made once.
+# The interface methods name calls whose context comes from outside the
+# module, as an incoming request's does.
+context.Context.Done
+context.Context.Err
+(*context.cancelCtx).Done
+(*context.cancelCtx).Err
+(*context.cancelCtx).Value
+(*context.timerCtx).Deadline
+(*context.valueCtx).Value
+(context.backgroundCtx).*
+(context.todoCtx).*
+(context.emptyCtx).*
+# Not Value or String: Value passes the context itself as a Context, which
+# boxes it.
+(context.withoutCancelCtx).Deadline
+(context.withoutCancelCtx).Done
+(context.withoutCancelCtx).Err
+(*net/http.Request).Context
+errors.Is
+
+# Clocks.
+time.Now
+time.Since
+time.Unix
+(time.Time).In
+(time.Time).UTC
+(time.Time).Sub
+(time.Time).UnixNano
+(time.Time).Unix
+(time.Time).Before
+(time.Time).After
+(time.Time).Equal
+# Date, Clock, Nanosecond, and Zone compute from the time and its zone
+# table. Like AppendFormat, the first use of Local loads its zone once.
+(time.Time).Date
+(time.Time).Clock
+(time.Time).Nanosecond
+(time.Time).Zone
+# A timer made once and reset, whose runtime timer is reused.
+(*time.Timer).Reset
+(*time.Timer).Stop
