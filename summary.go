@@ -76,10 +76,10 @@ func (c *checker) loadSummaries(env []string) error {
 			}
 		}
 	}
-	// A method call VTA resolves to nothing is also judged by every
-	// implementation outside the module.
+	// A method call VTA resolves to nothing, in the module or in a wrapper
+	// its calls reach, is also judged by every implementation outside it.
 	for _, fn := range append(slices.Clone(c.order), c.coverOrder...) {
-		if !c.ours(fn) {
+		if !c.ours(fn) && !wrapper(fn) {
 			continue
 		}
 		for _, b := range fn.Blocks {
@@ -310,7 +310,8 @@ var failureContexts = []failures{0, 1, 2, 3, 4, 5, 6, 7}
 
 // summarize works out the summaries of names, each as funcName has it.
 func summarize(cfg Config, env []string, names []string, archives map[string]string, assumed map[string]string) (map[string]summary, error) {
-	graph, err := packages.Load(&packages.Config{Mode: packages.NeedName | packages.NeedImports | packages.NeedDeps,
+	// Compiled files bring in the imports cgo adds, which SSA needs created.
+	graph, err := packages.Load(&packages.Config{Mode: packages.NeedName | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedDeps,
 		Dir: cfg.Dir, Env: env, Overlay: cfg.Overlay}, cfg.Patterns...)
 	if err != nil {
 		return nil, err

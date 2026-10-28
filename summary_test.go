@@ -166,7 +166,11 @@ func TestTheSummaryKeyFollowsTheBuild(t *testing.T) {
 	if k := key(nil, map[string][]byte{file: append(src, "\nfunc edited() {}\n"...)}); k != base {
 		t.Error("editing the module changed the key")
 	}
-	if k := key([]string{"GOOS=linux", "GOARCH=amd64"}, nil); k == base {
+	other := "amd64"
+	if runtime.GOARCH == other {
+		other = "arm64"
+	}
+	if k := key([]string{"GOOS=" + runtime.GOOS, "GOARCH=" + other}, nil); k == base {
 		t.Error("another platform kept the key")
 	}
 	if k := key([]string{"GOFLAGS=-gcflags=all=-l"}, nil); k == base {
@@ -599,5 +603,53 @@ func QuotedTo(w io.Writer, s string) string {
 				t.Fatalf("%s: %s is not reported relied on", a.Kind, a.Func)
 			}
 		}
+	}
+}
+
+// TestACgoPackageIsSummarized checks a module with a package that imports
+// "C", whose compiled files import packages its source does not, as
+// runtime/cgo and syscall: summarizing builds them all.
+func TestACgoPackageIsSummarized(t *testing.T) {
+	if out, err := exec.Command("go", "env", "CGO_ENABLED", "CC").Output(); err != nil {
+		t.Fatal(err)
+	} else if env := strings.Fields(string(out)); len(env) < 2 || env[0] != "1" {
+		t.Skip("cgo is disabled")
+	} else if _, err := exec.LookPath(env[1]); err != nil {
+		t.Skipf("no C compiler: %v", err)
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module repro\n\ngo 1.27\n",
+		"c/c.go": "package c\n\n// static int two(void) { return 2; }\nimport \"C\"\n\nfunc Two() int { return int(C.two()) }\n",
+		"root/root.go": `package root
+
+import (
+	"repro/c"
+	"strconv"
+)
+
+//noalloc:root
+func Root(n int) int {
+	return len(strconv.Itoa(n)) + c.Two()
+}
+`,
+	}
+	for name, src := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := Check(Config{Dir: dir, Patterns: []string{"./root"}, Module: "repro", SummaryCache: summaryCacheDir, Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+		return f.Func == "repro/root.Root" && slices.Contains(f.Reasons, "calls strconv.Itoa")
+	}) {
+		t.Errorf("strconv.Itoa is not judged by its summary: %v", res.Findings)
 	}
 }

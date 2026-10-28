@@ -132,7 +132,8 @@ func (c *checker) growsReused(in ssa.Instruction) bool {
 	if b, ok := cm.Value.(*ssa.Builtin); ok {
 		return b.Name() == "append" && len(cm.Args) > 1 && c.reused(cm.Args[0])
 	}
-	for _, callee := range c.expand(c.sites[call], map[*ssa.Function]bool{}) {
+	callees, _ := c.expand(c.sites[call], map[*ssa.Function]bool{})
+	for _, callee := range callees {
 		if c.appendRoot(callee) || c.returnsAppended(callee) {
 			if dst := appendedTo(cm, callee); dst != nil && c.reused(dst) {
 				return true

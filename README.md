@@ -643,7 +643,9 @@ library allocates.
 
 A method nothing implements is reported as a `call with no known callee`. A
 method call on a type parameter is checked against the parameter's
-constraint.
+constraint. A method value or method expression, as in `f := s.Area` then
+`f()`, is checked the same way as calling the method directly, and so is a
+method promoted from an embedded interface.
 
 noalloc allows:
 
@@ -663,8 +665,6 @@ Limits:
 - An unnamed interface, such as `interface{ Do() int }`, and `error` have no
   implementations noalloc can look up outside your module. Calls to them are
   reported, as in `calls error.Error`.
-- A call through a method value, as in `f := s.Area` then `f()`, is reported
-  as a `call with no known callee`.
 
 To allow a reported interface call, exempt the line or add the call to an
 allowlist file passed with `-allow`:

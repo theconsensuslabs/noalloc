@@ -2720,22 +2720,21 @@ func (c *checker) callAllocs(call ssa.CallInstruction) []string {
 		}
 		return nil
 	}
-	callees := c.expand(c.sites[call], map[*ssa.Function]bool{})
+	callees, wrapped := c.expand(c.sites[call], map[*ssa.Function]bool{})
 	var out []string
+	known := len(callees) > 0 || len(wrapped) > 0
 	if c.open[call] {
 		// The module's implementations are checked where they are defined.
 		// Those outside it are judged by their code, with no failure of
 		// theirs taken to end the call.
-		desc := callDesc(cm)
-		if s, ok := c.methodSummary(cm); ok && !s.NoImpl {
-			if s.Alloc[0] && !c.overridden(desc) {
-				c.noteWhy(call, s.Why[0])
-				out = append(out, "calls "+desc)
-			}
-		} else if len(callees) == 0 && !c.overridden(desc) {
-			return []string{"call with no known callee: " + desc}
-		}
-	} else if len(callees) == 0 {
+		reasons, ok := c.implAllocs(call, cm)
+		out, known = append(out, reasons...), known || ok
+	}
+	for _, w := range wrapped {
+		reasons, _ := c.implAllocs(call, w)
+		out = append(out, reasons...)
+	}
+	if !known {
 		desc := callDesc(cm)
 		if c.overridden(desc) {
 			return nil
@@ -2759,6 +2758,20 @@ func (c *checker) callAllocs(call ssa.CallInstruction) []string {
 		out = append(out, c.summaryAllocs(call, callee, funcName(callee))...)
 	}
 	return out
+}
+
+// implAllocs is why call allocates in the implementations outside the module
+// of cm, an interface method call, and whether there are any.
+func (c *checker) implAllocs(call ssa.CallInstruction, cm *ssa.CallCommon) ([]string, bool) {
+	s, ok := c.methodSummary(cm)
+	if !ok || s.NoImpl {
+		return nil, false
+	}
+	if desc := callDesc(cm); s.Alloc[0] && !c.overridden(desc) {
+		c.noteWhy(call, s.Why[0])
+		return []string{"calls " + desc}, true
+	}
+	return nil, true
 }
 
 // methodSummary is the summary of cm, a call of an interface method, as of
@@ -2893,9 +2906,12 @@ func funcValue(v ssa.Value) string {
 	return "a func value"
 }
 
-// expand replaces synthetic wrappers among callees with what they call.
-func (c *checker) expand(callees []*ssa.Function, seen map[*ssa.Function]bool) []*ssa.Function {
+// expand replaces synthetic wrappers among callees with what they call. It
+// also returns the interface method calls in those wrappers that VTA resolves
+// to nothing, as a promoted method of an embedded interface can make.
+func (c *checker) expand(callees []*ssa.Function, seen map[*ssa.Function]bool) ([]*ssa.Function, []*ssa.CallCommon) {
 	var out []*ssa.Function
+	var open []*ssa.CallCommon
 	for _, f := range callees {
 		if seen[f] {
 			continue
@@ -2911,9 +2927,17 @@ func (c *checker) expand(callees []*ssa.Function, seen map[*ssa.Function]bool) [
 				next = append(next, e.Callee.Func)
 			}
 		}
-		out = append(out, c.expand(next, seen)...)
+		for _, b := range f.Blocks {
+			for _, in := range b.Instrs {
+				if call, ok := in.(ssa.CallInstruction); ok && c.open[call] {
+					open = append(open, call.Common())
+				}
+			}
+		}
+		fs, cms := c.expand(next, seen)
+		out, open = append(out, fs...), append(open, cms...)
 	}
-	return out
+	return out, open
 }
 
 func inLoop(b *ssa.BasicBlock) bool {
