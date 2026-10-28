@@ -54,7 +54,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var scratch, allow, source list
 	dir := fs.String("C", ".", "run in `dir`, which relative paths are read from")
 	fs.Var(&scratch, "scratch", "a `type` whose slice and map fields are reused memory, as pkg/path.Name (repeatable)")
-	fs.Var(&allow, "allow", "a `file` of functions outside the module that do not allocate, added to the built-in list (repeatable)")
+	fs.Var(&allow, "allow", "a `file` of functions outside the module to take to allocate nothing, each as \"kind: function\", added to the built-in list (repeatable)")
 	fs.Var(&source, "source", "an import path `prefix` of packages to check from source as the module is, such as noalloc's bounded (repeatable)")
 	baseline := fs.String("baseline", "", "hold findings to the allocations listed in `file`")
 	exemptions := fs.String("exemptions", "", "hold //noalloc:exempt comments to the list in `file`")

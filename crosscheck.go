@@ -133,7 +133,7 @@ func (c *checker) growsReused(in ssa.Instruction) bool {
 		return b.Name() == "append" && len(cm.Args) > 1 && c.reused(cm.Args[0])
 	}
 	for _, callee := range c.expand(c.sites[call], map[*ssa.Function]bool{}) {
-		if c.appendRoot(callee) || c.allow.appends[funcName(callee)] {
+		if c.appendRoot(callee) || c.returnsAppended(callee) {
 			if dst := appendedTo(cm, callee); dst != nil && c.reused(dst) {
 				return true
 			}
@@ -145,9 +145,11 @@ func (c *checker) growsReused(in ssa.Instruction) bool {
 // crossCheck holds calls, from the compiled module, to what Check found.
 func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, found map[string]map[int]*Finding) *CrossCheck {
 	reached, known := map[string]bool{}, map[string]bool{}
+	names := map[string]string{}
 	for _, fn := range c.order {
 		if c.ours(fn) && fn.Blocks != nil {
 			reached[symbolOf(fn)] = true
+			names[symbolOf(fn)] = c.stableName(fn)
 		}
 	}
 	// A closure or a range-over-func loop body the compiler numbers apart from

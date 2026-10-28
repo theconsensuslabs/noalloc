@@ -79,9 +79,7 @@ func TestJSONRuntimeAndGeneratedCodeAllocateNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// gentest's ID is a fixture written with encoding/hex, which writes in
-	// place.
-	allow := append(strings.Split(Allowlist, "\n"), "encoding/hex.Encode", "encoding/hex.Decode")
+	allow := strings.Split(Allowlist, "\n")
 	// bounded is checked from source, as a caller of this package checks it.
 	sources := []string{boundedModule}
 	files := jsonRuntimeFiles(t)
@@ -125,7 +123,7 @@ func TestSourceModulesAreCheckedFromSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	gentest := jsonModule + "/internal/gentest"
-	allow := append(strings.Split(Allowlist, "\n"), "encoding/hex.Encode", "encoding/hex.Decode")
+	allow := strings.Split(Allowlist, "\n")
 	cfg := Config{Dir: dir, Patterns: []string{"./internal/gentest"}, Module: gentest, Root: dir, Allow: allow}
 	res, err := Check(cfg)
 	if err != nil {

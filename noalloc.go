@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/scanner"
 	"go/token"
@@ -70,8 +71,9 @@ type Config struct {
 	// lent to it. Slices and maps held in their fields, by value at any depth, are
 	// reused memory: appending to them and writing to them are allowed.
 	Scratch []string
-	// Allow lists functions outside the module known not to allocate, one
-	// pattern a line as Allowlist describes.
+	// Allow lists functions outside the module to take to allocate nothing,
+	// each for a reason it names, one a line as Allowlist describes. What
+	// every other function allocates is worked out from its code.
 	Allow []string
 	// Root is the directory findings are reported relative to.
 	Root string
@@ -84,6 +86,10 @@ type Config struct {
 	// that exempt only their own line: what the line calls is still checked.
 	// Every other exemption covers what its line calls too.
 	LineOnly []string
+	// SummaryCache is the directory the summaries of what calls out of the
+	// module run are kept in between checks, a file for each build; empty is
+	// noalloc's directory in the user's cache.
+	SummaryCache string
 	// Groups sorts the roots, named as SSA names them, into groups in order.
 	// A finding belongs to the first group whose roots reach its function; a
 	// root in no group is in a last group with no name.
@@ -96,13 +102,12 @@ type Group struct {
 	Roots []string
 }
 
-// Allowlist is the allowlist checked in beside this file. Each line is a
-// function as SSA names it ("strings.Index", "(*bytes.Reader).Read"), a
-// package or receiver with ".*" for all of its functions ("math/bits.*",
-// "(*sync.Mutex).*"), or an interface method ("context.Context.Err") for a
-// call whose concrete callee comes from outside the module, or "append: "
-// and a function that appends to its first argument as append does. Text
-// after # is a comment.
+// Allowlist is the allowlist checked in beside this file: the functions
+// outside the module noalloc takes to allocate nothing although their code
+// does not show it. Each line is "kind: name": a kind of debug, profiling,
+// amortized, or measured, and a function as SSA names it
+// ("(*sync.Mutex).Lock"), a pattern ending in "*" ("(*sync.Mutex).*"), or
+// the call with no known callee a finding names. Text after # is a comment.
 //
 //go:embed allow.txt
 var Allowlist string
@@ -120,6 +125,11 @@ type Finding struct {
 	Reasons []string
 	// Path is a shortest call path from a root to Func.
 	Path []string
+	// Why holds, for each reason that is a call out of the module whose
+	// code allocates, the chain of calls from it to what allocates.
+	Why map[string]string `json:",omitempty"`
+
+	sites []site
 }
 
 func (f Finding) String() string {
@@ -133,8 +143,8 @@ type Exemption struct {
 	Func   string
 	Reason string
 	// Covers is what the exemption lets through, each as function: reason,
-	// once: what its line allocates and, unless its kind is LineOnly, what
-	// its line calls that no root reaches another way.
+	// once for each allocation: what its line allocates and, unless its kind
+	// is LineOnly, what its line calls that no root reaches another way.
 	Covers []string
 	// Reached is whether a root reaches the exemption's line. One reached
 	// that covers nothing exempts nothing.
@@ -170,10 +180,42 @@ type Result struct {
 	// CrossCheck holds each call the module's compiled code makes to an
 	// allocating runtime function to what Check found.
 	CrossCheck *CrossCheck
+	// Assumptions are the allowlist's lines, each with whether a check
+	// relied on it.
+	Assumptions []Assumption
 }
+
+// An Assumption is an allowlist line: a function or call the check takes to
+// allocate nothing, for the reason its kind names (debug, profiling,
+// amortized, or measured).
+type Assumption struct {
+	Kind, Func string
+	// Used is whether the check relied on it: it covers a function the
+	// check reached that would allocate without it.
+	Used bool
+}
+
+// assumptionKinds are the reasons an allowlist line can give a function to
+// be taken to allocate nothing, as "kind: function": it allocates only on a
+// path that runs to debug or to profile, only to grow memory the runtime
+// keeps and reuses, so a cost that falls away as a program runs, or, for
+// what its code cannot show, as a test that calls it and counts its
+// allocations does.
+var assumptionKinds = []string{"debug", "profiling", "amortized", "measured"}
 
 // Check runs the checker.
 func Check(cfg Config) (*Result, error) {
+	// The compiler names files relative to Dir, and the load names them
+	// absolute.
+	var err error
+	if cfg.Dir, err = filepath.Abs(cfg.Dir); err != nil {
+		return nil, err
+	}
+	if cfg.Root != "" {
+		if cfg.Root, err = filepath.Abs(cfg.Root); err != nil {
+			return nil, err
+		}
+	}
 	env := cfg.Env
 	if env == nil {
 		env = os.Environ()
@@ -186,18 +228,19 @@ func Check(cfg Config) (*Result, error) {
 	type compiled struct {
 		escapes []escape
 		notes   []escape
+		inlines []escape
 		calls   []runtimeCall
 		starts  map[string]asmPos
 		err     error
 	}
 	done := make(chan compiled, 1)
 	go func() {
-		e, notes, asm, err := compilerEscapes(cfg, env)
+		r, err := compilerEscapes(cfg, env, nil)
 		if err != nil {
 			done <- compiled{err: err}
 			return
 		}
-		done <- compiled{e, notes, asm.calls, asm.starts, nil}
+		done <- compiled{r.escapes, r.notes, r.inlines, r.asm.calls, r.asm.starts, nil}
 	}()
 	pkgs, err := loadModule(cfg, env, ours)
 	if err != nil {
@@ -224,7 +267,11 @@ func Check(cfg Config) (*Result, error) {
 	}
 	prog.Build()
 
-	c := &checker{cfg: cfg, prog: prog, fset: prog.Fset, allow: parseAllow(cfg.Allow),
+	allow, err := parseAllow(cfg.Allow)
+	if err != nil {
+		return nil, err
+	}
+	c := &checker{cfg: cfg, prog: prog, fset: prog.Fset, allow: allow,
 		exempt: map[string]map[int]bool{}, lines: map[string][]string{}, appends: map[*ssa.Function]bool{},
 		fixed: map[types.Type]bool{}, marks: map[*ast.Comment]bool{}, lineState: map[string]map[int]uint8{},
 		moduleFiles: map[string]bool{}, inlinedBodies: map[*ssa.Function]bool{}}
@@ -266,22 +313,30 @@ func Check(cfg Config) (*Result, error) {
 		return nil, comp.err
 	}
 	escapes := comp.escapes
+	c.inlinedCalls = c.positions(comp.inlines)
+	c.inlinedEscapes = c.positions(inlinedEscapes(escapes))
 	c.graph()
 	c.reach(groupRoots(cfg.Groups, roots))
 	c.cover()
+	c.linknames = linknames(pkgs)
+	if err := c.loadSummaries(env); err != nil {
+		return nil, err
+	}
 
 	res := &Result{}
 	for _, r := range roots {
 		res.Roots = append(res.Roots, r.String())
 	}
 	found := map[string]map[int]*Finding{}
-	add := func(fn *ssa.Function, pos token.Position, reason string) {
+	sites := map[site]bool{}
+	add := func(fn *ssa.Function, at site) {
 		if is, ok := c.coveredBy[fn]; ok {
 			for _, i := range is {
-				c.addCover(i, fn, reason)
+				c.addCover(i, fn, at)
 			}
 			return
 		}
+		pos := at.pos
 		file := c.rel(pos.Filename)
 		if found[file] == nil {
 			found[file] = map[int]*Finding{}
@@ -292,9 +347,11 @@ func Check(cfg Config) (*Result, error) {
 				Group: c.group[fn], Path: c.path(fn)}
 			found[file][pos.Line] = f
 		}
-		if !slices.Contains(f.Reasons, reason) {
-			f.Reasons = append(f.Reasons, reason)
+		if !sites[at] {
+			sites[at] = true
+			f.Reasons = append(f.Reasons, at.reason)
 		}
+		f.sites = append(f.sites, at)
 	}
 	for _, fn := range c.order {
 		if !c.ours(fn) || fn.Blocks == nil {
@@ -311,15 +368,31 @@ func Check(cfg Config) (*Result, error) {
 	}
 	c.matchEscapes(escapes, comp.notes, add)
 	res.CrossCheck = c.crossCheck(comp.calls, comp.starts, found)
+	for f, kind := range c.allow.assumed {
+		res.Assumptions = append(res.Assumptions, Assumption{Kind: kind, Func: f, Used: c.reliedOn[f] || c.allow.used[f]})
+	}
+	slices.SortFunc(res.Assumptions, func(a, b Assumption) int { return strings.Compare(a.Func, b.Func) })
 	for i := range c.exemptions {
 		if i < len(c.covered) {
-			c.exemptions[i].Covers = slices.Sorted(maps.Keys(c.covered[i]))
+			for at := range c.covered[i] {
+				c.exemptions[i].Covers = append(c.exemptions[i].Covers, at.label)
+			}
+			slices.Sort(c.exemptions[i].Covers)
 		}
 	}
 	res.Exemptions = c.exemptions
 
 	for _, byLine := range found {
 		for _, f := range byLine {
+			for _, at := range f.sites {
+				if w := c.whyAt[at]; w != "" {
+					if f.Why == nil {
+						f.Why = map[string]string{}
+					}
+					f.Why[at.reason] = w
+				}
+			}
+			f.sites = nil
 			res.Findings = append(res.Findings, *f)
 		}
 	}
@@ -338,8 +411,9 @@ func Check(cfg Config) (*Result, error) {
 	return res, nil
 }
 
-// Report is res as text: a summary, the count of findings in each file, and
-// each finding with the call path that reaches its function.
+// Report is res as text: a summary, the count of findings in each file, each
+// finding with the call path that reaches its function, the exemptions, and
+// the allowlist's lines with whether a check relied on each.
 func Report(res *Result) string {
 	var b strings.Builder
 	files := map[string]int{}
@@ -360,6 +434,11 @@ func Report(res *Result) string {
 	shown := map[string]bool{}
 	for _, f := range res.Findings {
 		fmt.Fprintf(&b, "%s\n", f)
+		for _, r := range f.Reasons {
+			if w := f.Why[r]; w != "" {
+				fmt.Fprintf(&b, "    because %s\n", w)
+			}
+		}
 		if !shown[f.Func] {
 			shown[f.Func] = true
 			fmt.Fprintf(&b, "    reached by %s\n", strings.Join(f.Path, " > "))
@@ -390,13 +469,27 @@ func Report(res *Result) string {
 			fmt.Fprintf(&b, "    covers %s\n", c)
 		}
 	}
+	unused := 0
+	for _, a := range res.Assumptions {
+		if !a.Used {
+			unused++
+		}
+	}
+	fmt.Fprintf(&b, "\n%d allowlist lines; no check relied on %d:\n", len(res.Assumptions), unused)
+	for _, a := range res.Assumptions {
+		note := ""
+		if !a.Used {
+			note = " (nothing relied on it)"
+		}
+		fmt.Fprintf(&b, "%s: %s%s\n", a.Kind, a.Func, note)
+	}
 	return b.String()
 }
 
 // listModule returns the module's packages the patterns reach.
 func listModule(cfg Config, env []string) (ours []string, err error) {
 	graph, err := packages.Load(&packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedImports |
-		packages.NeedDeps, Dir: cfg.Dir, Env: env}, cfg.Patterns...)
+		packages.NeedDeps, Dir: cfg.Dir, Env: env, Overlay: cfg.Overlay}, cfg.Patterns...)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +556,7 @@ type checker struct {
 	exemptionAt map[string]map[int]int
 	coveredBy   map[*ssa.Function][]int
 	coverOrder  []*ssa.Function
-	covered     []map[string]bool
+	covered     []map[coverSite]bool
 	lines       map[string][]string
 
 	// appends holds the module's functions marked //noalloc:append, and
@@ -509,6 +602,35 @@ type checker struct {
 	roots map[*ssa.Function]bool
 	// carry memoizes carries.
 	carry map[carryKey]bool
+	// flags memoizes failureFlags.
+	flags map[carryKey]map[int]bool
+	// world, when set, is which packages are the module's, in place of
+	// Config's: for summaries, everything but the caller's module.
+	world func(path string) bool
+	// byLine indexes functions by the lines of their code, for funcsAt.
+	byLine map[string]map[int][]*ssa.Function
+	// appended, when set, answers returnsAppended as summaries are worked
+	// out, for a summarizing checker.
+	appended func(*ssa.Function) bool
+	// sums holds the summary of each function outside the module a reached
+	// call calls.
+	sums map[string]summary
+	// callWhy holds, for each call judged by a summary that allocates, why,
+	// and whyAt the same for each site a finding records.
+	callWhy map[ssa.CallInstruction]string
+	whyAt   map[site]string
+	// reliedOn holds the allowlist lines a summary this check read relied
+	// on, and linknames the symbols the module's functions with no Go body
+	// are bound to, as the summarizer's linknames has them.
+	reliedOn  map[string]bool
+	linknames map[string]string
+	// inlinedCalls holds the module's calls the compiler inlined, and
+	// inlinedEscapes those it reports an inlined body's escape at, other
+	// than a constant's, by position.
+	inlinedCalls, inlinedEscapes map[token.Pos]bool
+	// stops holds, for each function reach entered, the signals it returns
+	// that every caller reach came to it from stops on.
+	stops map[*ssa.Function]map[signal]bool
 
 	nonNil  memo[*ssa.Function]
 	fromScr memo[ssa.Value]
@@ -542,7 +664,19 @@ func (c *checker) ours(fn *ssa.Function) bool {
 	for fn.Parent() != nil {
 		fn = fn.Parent()
 	}
-	return fn.Pkg != nil && c.inModule(fn.Pkg.Pkg.Path())
+	if fn.Pkg == nil {
+		return false
+	}
+	if c.world != nil {
+		return c.world(fn.Pkg.Pkg.Path())
+	}
+	// sync is checked as outside code even from source: a sync.Once's
+	// function is setup that runs once, and a lock is no call into what it
+	// guards.
+	if fn.Pkg.Pkg.Path() == "sync" {
+		return false
+	}
+	return c.inModule(fn.Pkg.Pkg.Path())
 }
 
 // wrapper reports whether fn is a function SSA made up, such as a bound
@@ -555,7 +689,7 @@ func wrapper(fn *ssa.Function) bool {
 
 // outside reports whether fn belongs to a package outside the module.
 func (c *checker) outside(fn *ssa.Function) bool {
-	return !c.ours(fn) && fn.Pkg != nil
+	return !c.ours(fn) && topLevel(fn).Pkg != nil
 }
 
 func (c *checker) rel(file string) string {
@@ -783,7 +917,7 @@ func (c *checker) writtenFields() map[field]bool {
 					var dst ssa.Value
 					if bl, ok := in.Call.Value.(*ssa.Builtin); ok && bl.Name() == "append" && len(in.Call.Args) > 0 {
 						dst = in.Call.Args[0]
-					} else if f := in.Call.StaticCallee(); f != nil && (c.allow.appends[funcName(f)] || c.appendRoot(f)) {
+					} else if f := in.Call.StaticCallee(); f != nil && (c.returnsAppended(f) || c.appendRoot(f)) {
 						dst = appendedTo(&in.Call, f)
 					}
 					if dst == nil {
@@ -958,6 +1092,8 @@ func (c *checker) reach(groups []rootGroup) {
 	c.failing = map[*ssa.Function]failures{}
 	c.roots = map[*ssa.Function]bool{}
 	c.carry = map[carryKey]bool{}
+	c.flags = map[carryKey]map[int]bool{}
+	c.stops = map[*ssa.Function]map[signal]bool{}
 	for _, g := range groups {
 		for _, r := range g.roots {
 			c.roots[r] = true
@@ -999,6 +1135,50 @@ func (c *checker) failuresOf(fn *ssa.Function) failures {
 		return f
 	}
 	return failOnce
+}
+
+// callees returns what a call at site in fn, whose allowed blocks are ok,
+// reaches through callee: callee, and for a callee outside the module or
+// with no Go body the module functions the call hands it, with the failures
+// and stop signals each gets from the call.
+func (c *checker) callees(fn *ssa.Function, site ssa.CallInstruction, callee *ssa.Function, ok map[*ssa.BasicBlock]bool) ([]*ssa.Function, []failures, []map[signal]bool) {
+	next := []*ssa.Function{callee}
+	fails := []failures{c.calleeFailures(fn, site, callee, ok)}
+	stops := []map[signal]bool{c.stopsAt(fn, site, callee, ok)}
+	if c.outside(callee) || c.intoStd(fn, callee) || callee.Blocks == nil {
+		if top := topLevel(callee); top.Pkg != nil && top.Pkg.Pkg.Path() == "sync" {
+			return nil, nil, nil
+		}
+		for _, f := range c.handedOver(site) {
+			next = append(next, f)
+			fails = append(fails, 0)
+			stops = append(stops, nil)
+		}
+	}
+	for i, f := range next {
+		if c.roots[f] {
+			fails[i] = failOnce
+		}
+	}
+	return next, fails, stops
+}
+
+// intoStd reports whether a call from fn to callee leaves code outside the
+// standard library for code in it, which can call what it is handed by
+// reflection, a call the call graph cannot follow.
+func (c *checker) intoStd(fn, callee *ssa.Function) bool {
+	to, from := topLevel(callee), topLevel(fn)
+	return to.Pkg != nil && c.standard(to.Pkg.Pkg.Path()) && from.Pkg != nil && !c.standard(from.Pkg.Pkg.Path())
+}
+
+// standard reports whether path is a standard library package: one outside
+// the module whose first element, as Go has it, has no dot.
+func (c *checker) standard(path string) bool {
+	if path == c.cfg.Module || strings.HasPrefix(path, c.cfg.Module+"/") {
+		return false
+	}
+	first, _, _ := strings.Cut(path, "/")
+	return !strings.Contains(first, ".")
 }
 
 // calleeFailures is how the failures of callee, called at site in fn, whose
@@ -1054,46 +1234,343 @@ func (c *checker) propagatesError(site ssa.CallInstruction, callee *ssa.Function
 			return false
 		}
 	}
-	return c.errorEnds(call.Block(), err, ok, false)
+	fn, idx := site.Parent(), errorResult(site.Parent())
+	start := &facts{is: map[ssa.Value]bool{err: true}, flags: map[ssa.Value]bool{}, fields: map[valueField]bool{}}
+	for j, v := range c.errorFlags(callee) {
+		for _, r := range *call.Referrers() {
+			if x, isExtract := r.(*ssa.Extract); isExtract && x.Index == j {
+				start.flags[x] = v
+			}
+		}
+	}
+	return c.pathsFrom(call.Block(), start, ok, c.failuresOf(fn)&failOnce == failOnce, func(ret *ssa.Return, f *facts) bool {
+		return idx >= 0 && f.is[ret.Results[idx]] || c.endsAt(fn, ret, f)
+	})
 }
 
-// errorEnds reports whether every path from b on which err is not nil, and
-// not a package-level sentinel, ends without err being dropped: in a block
-// not in ok, which is a failure, in a panic, or in a return of err as b's
-// function's error, or, with nonNil, of any error that cannot be nil. A nil
-// ok counts no block as a failure. It follows err through the phis it
-// reaches and into a module helper that returns it, and gives up on a path
-// that comes back to b or runs past a fixed number of steps.
-func (c *checker) errorEnds(b *ssa.BasicBlock, err ssa.Value, ok map[*ssa.BasicBlock]bool, nonNil bool) bool {
+// errorFlags maps each bool result of fn, a module function, to the value it
+// has on every return whose error may not be nil, for the results that have
+// one.
+func (c *checker) errorFlags(fn *ssa.Function) map[int]bool {
+	idx := errorResult(fn)
+	if idx < 0 || fn.Blocks == nil || !c.ours(fn) {
+		return nil
+	}
+	return boolResults(fn, func(j int) (want, set bool) {
+		for _, b := range fn.Blocks {
+			ret, isRet := b.Instrs[len(b.Instrs)-1].(*ssa.Return)
+			if !isRet {
+				continue
+			}
+			if n, isConst := ret.Results[idx].(*ssa.Const); isConst && n.IsNil() {
+				continue
+			}
+			k, isConst := ret.Results[j].(*ssa.Const)
+			if !isConst || k.Value == nil || set && constant.BoolVal(k.Value) != want {
+				return false, false
+			}
+			want, set = constant.BoolVal(k.Value), true
+		}
+		return want, set
+	})
+}
+
+// boolResults maps each bool result j of fn to the value one gives it, for
+// the results one reports a value for.
+func boolResults(fn *ssa.Function, one func(j int) (v, ok bool)) map[int]bool {
+	results := fn.Signature.Results()
+	out := map[int]bool{}
+	for j := range results.Len() {
+		if b, isBasic := results.At(j).Type().Underlying().(*types.Basic); !isBasic || b.Kind() != types.Bool {
+			continue
+		}
+		if v, ok := one(j); ok {
+			out[j] = v
+		}
+	}
+	return out
+}
+
+// A signal is a bool a function returns, its result'th result or, when field
+// is not -1, that field of it, with the value v.
+type signal struct {
+	result, field int
+	v             bool
+}
+
+// endsAt reports whether ret, a return of fn on a path from a failure that
+// does not come back to it, ends what the failure is part of: fn runs once in
+// a root's call, so the failure is made once, or ret returns a signal every
+// caller stops on.
+func (c *checker) endsAt(fn *ssa.Function, ret *ssa.Return, f *facts) bool {
+	if c.failuresOf(fn)&failOnce == failOnce {
+		return true
+	}
+	stops := c.stops[fn]
+	for j, r := range ret.Results {
+		if v, known := f.value(r); known && stops[signal{j, -1, v}] {
+			return true
+		}
+		for k, v := range f.fields {
+			if k.v == r && stops[signal{j, k.field, v}] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stopsAt returns the signals of callee that fn, whose allowed blocks are ok,
+// stops on at site, where its failures end the root's call: every path from
+// the call on which callee returns the signal ends in a failure of fn, in a
+// return of a non-nil error, or as endsAt has it.
+func (c *checker) stopsAt(fn *ssa.Function, site ssa.CallInstruction, callee *ssa.Function, ok map[*ssa.BasicBlock]bool) map[signal]bool {
+	call, isCall := site.(*ssa.Call)
+	if !isCall || !c.ours(fn) || !c.ours(callee) || c.failuresOf(fn)&failErrors == 0 {
+		return nil
+	}
+	results := callee.Signature.Results()
+	resultValue := func(j int) ssa.Value {
+		if results.Len() == 1 {
+			return call
+		}
+		for _, r := range *call.Referrers() {
+			if x, isExtract := r.(*ssa.Extract); isExtract && x.Index == j {
+				return x
+			}
+		}
+		return nil
+	}
+	idx := errorResult(fn)
+	var out map[signal]bool
+	for j := range results.Len() {
+		r := resultValue(j)
+		if r == nil {
+			continue
+		}
+		var cands []signal
+		switch t := results.At(j).Type().Underlying().(type) {
+		case *types.Basic:
+			if t.Kind() == types.Bool {
+				cands = []signal{{j, -1, true}, {j, -1, false}}
+			}
+		case *types.Struct:
+			for k := range t.NumFields() {
+				if b, isBasic := t.Field(k).Type().Underlying().(*types.Basic); isBasic && b.Kind() == types.Bool {
+					cands = append(cands, signal{j, k, true}, signal{j, k, false})
+				}
+			}
+		}
+		for _, s := range cands {
+			start := &facts{is: map[ssa.Value]bool{}, flags: map[ssa.Value]bool{}, fields: map[valueField]bool{}}
+			if s.field < 0 {
+				start.flags[r] = s.v
+			} else {
+				start.fields[valueField{r, s.field}] = s.v
+			}
+			if c.pathsFrom(call.Block(), start, ok, c.failuresOf(fn)&failOnce == failOnce, func(ret *ssa.Return, f *facts) bool {
+				return idx >= 0 && c.definitelyNonNil(ret.Results[idx], ret.Block(), map[ssa.Value]bool{}) || c.endsAt(fn, ret, f)
+			}) {
+				if out == nil {
+					out = map[signal]bool{}
+				}
+				out[s] = true
+			}
+		}
+	}
+	return out
+}
+
+func subset(a, b map[signal]bool) bool {
+	for s := range a {
+		if !b[s] {
+			return false
+		}
+	}
+	return true
+}
+
+func intersect(a, b map[signal]bool) map[signal]bool {
+	var out map[signal]bool
+	for s := range a {
+		if b[s] {
+			if out == nil {
+				out = map[signal]bool{}
+			}
+			out[s] = true
+		}
+	}
+	return out
+}
+
+// errorEnds reports whether every path from b on which err is a failure
+// ends in a panic or in a return of an error that cannot be nil as b's
+// function's error, as failurePaths follows them.
+func (c *checker) errorEnds(b *ssa.BasicBlock, err ssa.Value) bool {
 	idx := errorResult(b.Parent())
+	return c.failurePaths(b, err, nil, func(ret *ssa.Return, f *facts) bool {
+		if idx < 0 {
+			return false
+		}
+		v := ret.Results[idx]
+		return f.is[v] || c.definitelyNonNil(v, ret.Block(), map[ssa.Value]bool{})
+	})
+}
+
+// failurePaths reports whether every path from b on which err is a failure,
+// not nil and not a package-level sentinel, ends in a block not in ok, in a
+// panic, or in a return that ret accepts, given what is known on the path. A
+// nil ok counts no block as a failure. It follows err through the phis it
+// reaches and into a module helper that returns it, along with each bool the
+// helper returns that has one value whenever err is a failure, and gives up
+// on a path that comes back to b or runs past a fixed number of steps.
+func (c *checker) failurePaths(b *ssa.BasicBlock, err ssa.Value, ok map[*ssa.BasicBlock]bool, ret func(*ssa.Return, *facts) bool) bool {
+	return c.pathsFrom(b, &facts{is: map[ssa.Value]bool{err: true}, flags: map[ssa.Value]bool{}, fields: map[valueField]bool{}}, ok, false, ret)
+}
+
+// facts is what a path from a failure knows: the values that hold the
+// failure, bools with a known value, and bool fields with a known value, of
+// a struct value or of the struct a local variable holds.
+type facts struct {
+	is, flags map[ssa.Value]bool
+	fields    map[valueField]bool
+}
+
+type valueField struct {
+	v     ssa.Value
+	field int
+}
+
+func (f *facts) clone() *facts {
+	return &facts{maps.Clone(f.is), maps.Clone(f.flags), maps.Clone(f.fields)}
+}
+
+// forgetShared forgets the fields a call can write: those of a variable
+// whose address is taken other than to read or write a field, or for a call
+// deferred to the function's return.
+func (f *facts) forgetShared() {
+	for k := range f.fields {
+		if a, isAlloc := k.v.(*ssa.Alloc); isAlloc && addressTaken(a) {
+			delete(f.fields, k)
+		} else if _, isPtr := k.v.Type().Underlying().(*types.Pointer); isPtr && !isAlloc {
+			delete(f.fields, k)
+		}
+	}
+}
+
+func addressTaken(a *ssa.Alloc) bool {
+	for _, r := range *a.Referrers() {
+		switch r := r.(type) {
+		case *ssa.FieldAddr:
+			for _, rr := range *r.Referrers() {
+				switch rr := rr.(type) {
+				case *ssa.UnOp:
+					if rr.Op != token.MUL {
+						return true
+					}
+				case *ssa.Store:
+					if rr.Val == ssa.Value(r) {
+						return true
+					}
+				case *ssa.DebugRef:
+				default:
+					return true
+				}
+			}
+		case *ssa.Store:
+			if r.Val == ssa.Value(a) {
+				return true
+			}
+		case *ssa.UnOp:
+			if r.Op != token.MUL {
+				return true
+			}
+		case *ssa.DebugRef, *ssa.Defer:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// copyFields gives to what dst holds the known fields of src.
+func (f *facts) copyFields(dst, src ssa.Value) {
+	for k := range f.fields {
+		if k.v == dst {
+			delete(f.fields, k)
+		}
+	}
+	for k, v := range f.fields {
+		if k.v == src {
+			f.fields[valueField{dst, k.field}] = v
+		}
+	}
+}
+
+// pathsFrom is failurePaths from b with start known. With once, b's function
+// runs once in a root's call, so a path that can no longer come back to b
+// ends.
+func (c *checker) pathsFrom(b *ssa.BasicBlock, start *facts, ok map[*ssa.BasicBlock]bool, once bool, ret func(*ssa.Return, *facts) bool) bool {
 	steps := 0
 	onPath := map[*ssa.BasicBlock]bool{}
-	var walk func(x, from *ssa.BasicBlock, is map[ssa.Value]bool) bool
-	walk = func(x, from *ssa.BasicBlock, is map[ssa.Value]bool) bool {
+	var back map[*ssa.BasicBlock]bool
+	if once {
+		back = reachesBack(b)
+	}
+	var walk func(x, from *ssa.BasicBlock, f *facts) bool
+	walk = func(x, from *ssa.BasicBlock, f *facts) bool {
 		if ok != nil && !ok[x] {
 			return true
 		}
-		// Coming back to b runs it again with err dropped. Another loop's
-		// way out is a path of its own.
+		if back != nil && !back[x] {
+			return true
+		}
+		// Coming back to b runs it again with the failure dropped. Another
+		// loop's way out is a path of its own.
 		if x == b && from != nil {
 			return false
 		}
 		if onPath[x] {
 			return true
 		}
-		if steps++; steps > errorEndsSteps {
+		if steps++; steps > failurePathSteps {
 			return false
 		}
-		is = maps.Clone(is)
+		f = f.clone()
 		for _, in := range x.Instrs {
 			switch in := in.(type) {
 			case *ssa.Phi:
-				if from != nil && is[in.Edges[slices.Index(x.Preds, from)]] {
-					is[in] = true
+				if from != nil && f.is[in.Edges[slices.Index(x.Preds, from)]] {
+					f.is[in] = true
 				}
 			case *ssa.Call:
-				if out := c.carried(in, is); out != nil {
-					is[out] = true
+				if out, k := c.carried(in, f.is); out != nil {
+					f.is[out] = true
+					for j, v := range c.failureFlags(in.Call.StaticCallee(), k) {
+						for _, r := range *in.Referrers() {
+							if x, isExtract := r.(*ssa.Extract); isExtract && x.Index == j {
+								f.flags[x] = v
+							}
+						}
+					}
+				}
+				f.forgetShared()
+			case *ssa.Go:
+				f.forgetShared()
+			case *ssa.Store:
+				switch addr := in.Addr.(type) {
+				case *ssa.FieldAddr:
+					if v, isConst := in.Val.(*ssa.Const); isConst && v.Value != nil && v.Value.Kind() == constant.Bool {
+						f.fields[valueField{addr.X, addr.Field}] = constant.BoolVal(v.Value)
+					} else {
+						delete(f.fields, valueField{addr.X, addr.Field})
+					}
+				case *ssa.Alloc:
+					f.copyFields(addr, in.Val)
+				}
+			case *ssa.UnOp:
+				if _, isAlloc := in.X.(*ssa.Alloc); isAlloc && in.Op == token.MUL {
+					f.copyFields(in, in.X)
 				}
 			}
 		}
@@ -1102,14 +1579,16 @@ func (c *checker) errorEnds(b *ssa.BasicBlock, err ssa.Value, ok map[*ssa.BasicB
 		case *ssa.Panic:
 			return true
 		case *ssa.Return:
-			if idx < 0 {
-				return false
-			}
-			v := last.Results[idx]
-			return is[v] || nonNil && c.definitelyNonNil(v, x, map[ssa.Value]bool{})
+			return ret(last, f)
 		case *ssa.If:
-			if arm, decided := errArm(last, is); decided {
+			if arm, decided := errArm(last, f.is); decided {
 				succs = succs[arm : arm+1]
+			} else if v, known := f.value(last.Cond); known {
+				if v {
+					succs = succs[:1]
+				} else {
+					succs = succs[1:]
+				}
 			}
 		}
 		if len(succs) == 0 {
@@ -1118,17 +1597,98 @@ func (c *checker) errorEnds(b *ssa.BasicBlock, err ssa.Value, ok map[*ssa.BasicB
 		onPath[x] = true
 		defer delete(onPath, x)
 		for _, s := range succs {
-			if !walk(s, x, is) {
+			if !walk(s, x, f) {
 				return false
 			}
 		}
 		return true
 	}
-	return walk(b, nil, map[ssa.Value]bool{err: true})
+	return walk(b, nil, start)
 }
 
-// errorEndsSteps bounds the blocks errorEnds visits for one error.
-const errorEndsSteps = 4096
+// reachesBack returns the blocks from which a path reaches b.
+func reachesBack(b *ssa.BasicBlock) map[*ssa.BasicBlock]bool {
+	out := map[*ssa.BasicBlock]bool{b: true}
+	stack := []*ssa.BasicBlock{b}
+	for len(stack) > 0 {
+		x := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range x.Preds {
+			if !out[p] {
+				out[p] = true
+				stack = append(stack, p)
+			}
+		}
+	}
+	return out
+}
+
+// value is the value v, a bool, has on the path, when the path decides it: a
+// known bool or field, its negation, or a comparison of a failure with nil.
+func (f *facts) value(v ssa.Value) (bool, bool) {
+	if b, known := f.flags[v]; known {
+		return b, true
+	}
+	switch v := v.(type) {
+	case *ssa.UnOp:
+		switch v.Op {
+		case token.NOT:
+			b, known := f.value(v.X)
+			return !b, known
+		case token.MUL:
+			if a, isField := v.X.(*ssa.FieldAddr); isField {
+				b, known := f.fields[valueField{a.X, a.Field}]
+				return b, known
+			}
+		}
+	case *ssa.Field:
+		b, known := f.fields[valueField{v.X, v.Field}]
+		return b, known
+	case *ssa.BinOp:
+		if v.Op != token.EQL && v.Op != token.NEQ {
+			break
+		}
+		x, y := v.X, v.Y
+		if !f.is[x] {
+			x, y = y, x
+		}
+		if n, isConst := y.(*ssa.Const); f.is[x] && isConst && n.IsNil() {
+			return v.Op == token.NEQ, true
+		}
+	case *ssa.Const:
+		if v.Value != nil && v.Value.Kind() == constant.Bool {
+			return constant.BoolVal(v.Value), true
+		}
+	}
+	return false, false
+}
+
+// failureFlags maps each bool result of fn to the value it has on every
+// return where its k-th parameter, an error, is a failure, for the results
+// that have one.
+func (c *checker) failureFlags(fn *ssa.Function, k int) map[int]bool {
+	key := carryKey{fn, k}
+	if v, seen := c.flags[key]; seen {
+		return v
+	}
+	c.flags[key] = nil
+	out := boolResults(fn, func(j int) (want, set bool) {
+		ok := c.failurePaths(fn.Blocks[0], fn.Params[k], nil, func(ret *ssa.Return, f *facts) bool {
+			v, known := f.value(ret.Results[j])
+			if !known || set && v != want {
+				return false
+			}
+			want, set = v, true
+			return true
+		})
+		return want, ok && set
+	})
+	c.flags[key] = out
+	return out
+}
+
+// failurePathSteps bounds the blocks pathsFrom visits for one failure.
+const failurePathSteps = 4096
 
 // errArm is the successor an If takes when the error it tests, one of is,
 // is neither nil nor a package-level sentinel, when the If decides it.
@@ -1153,6 +1713,11 @@ func errArm(br *ssa.If, is map[ssa.Value]bool) (int, bool) {
 		if _, isGlobal := o.X.(*ssa.Global); !isGlobal || o.Op != token.MUL {
 			return 0, false
 		}
+	case *ssa.MakeInterface:
+		// A constant error, which nothing allocates.
+		if _, isConst := o.X.(*ssa.Const); !isConst {
+			return 0, false
+		}
 	default:
 		return 0, false
 	}
@@ -1162,32 +1727,33 @@ func errArm(br *ssa.If, is map[ssa.Value]bool) (int, bool) {
 	return 1, true
 }
 
-// carried is the error result of call when call passes one of is to a
-// module function that returns it whenever it is a failure, or nil.
-func (c *checker) carried(call *ssa.Call, is map[ssa.Value]bool) ssa.Value {
+// carried is the error result of call when call passes one of is, as its
+// k-th argument, to a module function that returns it whenever it is a
+// failure, or nil.
+func (c *checker) carried(call *ssa.Call, is map[ssa.Value]bool) (ssa.Value, int) {
 	callee := call.Call.StaticCallee()
 	if callee == nil || !c.ours(callee) || callee.Blocks == nil {
-		return nil
+		return nil, 0
 	}
 	idx := errorResult(callee)
 	if idx < 0 {
-		return nil
+		return nil, 0
 	}
 	for k, a := range call.Call.Args {
 		if !is[a] || k >= len(callee.Params) || !c.carries(callee, k) {
 			continue
 		}
 		if callee.Signature.Results().Len() == 1 {
-			return call
+			return call, k
 		}
 		for _, r := range *call.Referrers() {
 			if x, isExtract := r.(*ssa.Extract); isExtract && x.Index == idx {
-				return x
+				return x, k
 			}
 		}
-		return nil
+		return nil, 0
 	}
-	return nil
+	return nil, 0
 }
 
 // carries reports whether fn returns a non-nil error whenever its k-th
@@ -1198,7 +1764,7 @@ func (c *checker) carries(fn *ssa.Function, k int) bool {
 		return v
 	}
 	c.carry[key] = false
-	v := types.Identical(fn.Params[k].Type(), errorType) && c.errorEnds(fn.Blocks[0], fn.Params[k], nil, true)
+	v := types.Identical(fn.Params[k].Type(), errorType) && c.errorEnds(fn.Blocks[0], fn.Params[k])
 	c.carry[key] = v
 	return v
 }
@@ -1278,27 +1844,14 @@ func (c *checker) walk(queue []*ssa.Function, group string) {
 				c.sites[e.Site] = append(c.sites[e.Site], callee)
 				c.callers[callee] = append(c.callers[callee], e.Site)
 			}
-			next := []*ssa.Function{callee}
-			fails := []failures{c.calleeFailures(fn, e.Site, callee, ok)}
-			if c.outside(callee) {
-				if callee.Pkg != nil && callee.Pkg.Pkg.Path() == "sync" {
-					continue
-				}
-				for _, f := range c.handedOver(e.Site) {
-					next = append(next, f)
-					fails = append(fails, 0)
-				}
-			}
+			next, fails, stops := c.callees(fn, e.Site, callee, ok)
 			for i, f := range next {
-				if c.roots[f] {
-					fails[i] = failOnce
-				}
 				if _, seen := c.parent[f]; !seen {
 					c.parent[f] = fn
-					c.failing[f] = fails[i]
+					c.failing[f], c.stops[f] = fails[i], stops[i]
 					queue = append(queue, f)
-				} else if was := c.failuresOf(f); was&fails[i] != was {
-					c.failing[f] = was & fails[i]
+				} else if was, ws := c.failuresOf(f), c.stops[f]; was&fails[i] != was || !subset(ws, stops[i]) {
+					c.failing[f], c.stops[f] = was&fails[i], intersect(ws, stops[i])
 					queue = append(queue, f)
 				}
 			}
@@ -1421,15 +1974,34 @@ func (c *checker) exemptionIndex(pos token.Pos) (int, bool) {
 	return i, ok
 }
 
-// addCover records that exemption i lets reason through in fn.
-func (c *checker) addCover(i int, fn *ssa.Function, reason string) {
+// A site is one allocation: a reason at a column of a line. The compiler can
+// report one escape at a column more than once, which nth tells apart.
+type site struct {
+	pos    token.Position
+	nth    int
+	reason string
+}
+
+func newSite(pos token.Position, reason string) site {
+	return site{pos: token.Position{Filename: pos.Filename, Line: pos.Line, Column: pos.Column}, reason: reason}
+}
+
+// addCover records that exemption i lets at through in fn.
+func (c *checker) addCover(i int, fn *ssa.Function, at site) {
 	for len(c.covered) <= i {
 		c.covered = append(c.covered, nil)
 	}
 	if c.covered[i] == nil {
-		c.covered[i] = map[string]bool{}
+		c.covered[i] = map[coverSite]bool{}
 	}
-	c.covered[i][c.stableName(fn)+": "+reason] = true
+	c.covered[i][coverSite{at, c.stableName(fn) + ": " + at.reason}] = true
+}
+
+// A coverSite is an allocation an exemption covers, with how its list names
+// it.
+type coverSite struct {
+	site
+	label string
 }
 
 // cover walks, from each exempt line a root reaches whose kind is not
@@ -1450,23 +2022,10 @@ func (c *checker) cover() {
 		if !slices.Contains(c.sites[e.Site], callee) {
 			c.sites[e.Site] = append(c.sites[e.Site], callee)
 		}
-		next := []*ssa.Function{callee}
-		fails := []failures{c.calleeFailures(fn, e.Site, callee, ok)}
-		if c.outside(callee) {
-			if callee.Pkg != nil && callee.Pkg.Pkg.Path() == "sync" {
-				return
-			}
-			for _, f := range c.handedOver(e.Site) {
-				next = append(next, f)
-				fails = append(fails, 0)
-			}
-		}
+		next, fails, stops := c.callees(fn, e.Site, callee, ok)
 		for i, f := range next {
 			if _, reached := c.parent[f]; reached {
 				continue
-			}
-			if c.roots[f] {
-				fails[i] = failOnce
 			}
 			have := c.coveredBy[f]
 			_, seen := c.coveredBy[f]
@@ -1474,10 +2033,10 @@ func (c *checker) cover() {
 				c.coverOrder = append(c.coverOrder, f)
 			}
 			stricter := false
-			if was := c.failuresOf(f); !seen {
-				c.failing[f] = fails[i]
-			} else if was&fails[i] != was {
-				c.failing[f] = was & fails[i]
+			if was, ws := c.failuresOf(f), c.stops[f]; !seen {
+				c.failing[f], c.stops[f] = fails[i], stops[i]
+			} else if was&fails[i] != was || !subset(ws, stops[i]) {
+				c.failing[f], c.stops[f] = was&fails[i], intersect(ws, stops[i])
 				delete(c.blocks, f)
 				stricter = true
 			}
@@ -1836,7 +2395,8 @@ func nilCompare(cond ssa.Value) (ssa.Value, token.Token) {
 
 // lazyInit returns fn's blocks that set up a field or package variable the
 // first time it is used: those dominated by the branch taken when it is nil,
-// where that branch stores to it.
+// where that branch stores to it, or, for one loaded through sync/atomic,
+// stores to it through sync/atomic.
 func lazyInit(fn *ssa.Function) []*ssa.BasicBlock {
 	var out []*ssa.BasicBlock
 	for _, p := range fn.Blocks {
@@ -1845,11 +2405,19 @@ func lazyInit(fn *ssa.Function) []*ssa.BasicBlock {
 			continue
 		}
 		x, op := nilCompare(ifi.Cond)
-		load, ok := x.(*ssa.UnOp)
-		if !ok || load.Op != token.MUL {
-			continue
+		var addr ssa.Value
+		atomically := false
+		switch x := x.(type) {
+		case *ssa.UnOp:
+			if x.Op == token.MUL {
+				addr = x.X
+			}
+		case *ssa.Call:
+			if atomicMethod(x.Common(), "Load") {
+				addr, atomically = x.Call.Args[0], true
+			}
 		}
-		switch load.X.(type) {
+		switch addr.(type) {
 		case *ssa.FieldAddr, *ssa.Global:
 		default:
 			continue
@@ -1869,7 +2437,12 @@ func lazyInit(fn *ssa.Function) []*ssa.BasicBlock {
 			}
 			region = append(region, b)
 			for _, in := range b.Instrs {
-				if st, ok := in.(*ssa.Store); ok && sameAddr(st.Addr, load.X) {
+				if st, ok := in.(*ssa.Store); ok && !atomically && sameAddr(st.Addr, addr) {
+					stores = true
+				}
+				if call, ok := in.(ssa.CallInstruction); ok && atomically &&
+					(atomicMethod(call.Common(), "Store") || atomicMethod(call.Common(), "CompareAndSwap") || atomicMethod(call.Common(), "Swap")) &&
+					sameAddr(call.Common().Args[0], addr) {
 					stores = true
 				}
 			}
@@ -1879,6 +2452,17 @@ func lazyInit(fn *ssa.Function) []*ssa.BasicBlock {
 		}
 	}
 	return out
+}
+
+// atomicMethod reports whether cm calls method of a sync/atomic type on a
+// value it is handed the address of, such as (*atomic.Value).Load.
+func atomicMethod(cm *ssa.CallCommon, method string) bool {
+	callee := cm.StaticCallee()
+	if callee == nil || len(cm.Args) == 0 || callee.Name() != method {
+		return false
+	}
+	top := topLevel(callee)
+	return top.Pkg != nil && top.Pkg.Pkg.Path() == "sync/atomic" && callee.Signature.Recv() != nil
 }
 
 // sameAddr reports whether a and b are the same field or package variable
@@ -1899,7 +2483,7 @@ func sameAddr(a, b ssa.Value) bool {
 }
 
 // check adds what fn's allowed blocks allocate.
-func (c *checker) check(fn *ssa.Function, add func(*ssa.Function, token.Position, string)) {
+func (c *checker) check(fn *ssa.Function, add func(*ssa.Function, site)) {
 	ok := c.blocks[fn]
 	for _, b := range fn.Blocks {
 		if !ok[b] {
@@ -1916,15 +2500,158 @@ func (c *checker) check(fn *ssa.Function, add func(*ssa.Function, token.Position
 			if i, ok := c.exemptionIndex(pos); ok {
 				c.exemptions[i].Reached = true
 				for _, r := range c.instrAllocs(in) {
-					c.addCover(i, fn, r)
+					c.addCover(i, fn, newSite(c.sitePos(in, pos), r))
 				}
 				continue
 			}
 			for _, r := range c.instrAllocs(in) {
-				add(fn, c.fset.Position(pos), r)
+				at := newSite(c.sitePos(in, pos), r)
+				add(fn, at)
+				if call, isCall := in.(ssa.CallInstruction); isCall && c.callWhy[call] != "" && strings.HasPrefix(r, "calls ") {
+					c.whyAt[at] = c.callWhy[call]
+				}
 			}
 		}
 	}
+}
+
+// sitePos is where in's allocation is counted, given pos, where it is. The
+// entries of a map literal on a line fill one map, so they count at the
+// literal's opening brace.
+func (c *checker) sitePos(in ssa.Instruction, pos token.Pos) token.Position {
+	p := c.fset.Position(pos)
+	u, ok := in.(*ssa.MapUpdate)
+	if !ok {
+		return p
+	}
+	m, ok := u.Map.(*ssa.MakeMap)
+	if !ok || !m.Pos().IsValid() {
+		return p
+	}
+	f, _ := c.syntax(p.Filename)
+	if f == nil {
+		return p
+	}
+	path, _ := astutil.PathEnclosingInterval(f, m.Pos(), m.Pos())
+	for _, n := range path {
+		if lit, ok := n.(*ast.CompositeLit); ok && lit.Lbrace == m.Pos() && pos > lit.Lbrace && pos < lit.Rbrace {
+			p.Column = c.fset.Position(lit.Lbrace).Column
+			break
+		}
+	}
+	return p
+}
+
+// concatOperand reports whether v is only an operand of another string
+// concatenation on its line, which the compiler joins with it into one.
+func (c *checker) concatOperand(v *ssa.BinOp) bool {
+	refs := *v.Referrers()
+	if len(refs) != 1 {
+		return false
+	}
+	b, ok := refs[0].(*ssa.BinOp)
+	return ok && b.Op == token.ADD && isString(b.Type()) &&
+		c.fset.Position(b.Pos()).Line == c.fset.Position(v.Pos()).Line
+}
+
+// handGrownAt reports whether msg, an escape the compiler reports on line of
+// file, is a make there that grows reused memory by hand, as growsOwnByHand
+// has it, which that rule judges as it judges an append.
+func (c *checker) handGrownAt(file string, line int, msg string) bool {
+	if !strings.HasPrefix(msg, "make(") {
+		return false
+	}
+	for _, fn := range c.funcsAt(file, line) {
+		for _, b := range fn.Blocks {
+			for _, in := range b.Instrs {
+				if m, isMake := in.(*ssa.MakeSlice); isMake && m.Pos().IsValid() && c.fset.Position(m.Pos()).Line == line && c.growsOwnByHand(m) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// funcsAt returns the functions whose code is on line of file.
+func (c *checker) funcsAt(file string, line int) []*ssa.Function {
+	if c.byLine == nil {
+		c.byLine = map[string]map[int][]*ssa.Function{}
+		for fn := range ssautil.AllFunctions(c.prog) {
+			if fn.Syntax() == nil {
+				continue
+			}
+			start, end := c.fset.Position(fn.Syntax().Pos()), c.fset.Position(fn.Syntax().End())
+			f := filepath.Clean(start.Filename)
+			if c.byLine[f] == nil {
+				c.byLine[f] = map[int][]*ssa.Function{}
+			}
+			for l := start.Line; l <= end.Line; l++ {
+				c.byLine[f][l] = append(c.byLine[f][l], fn)
+			}
+		}
+	}
+	return c.byLine[file][line]
+}
+
+// growsOwnByHand reports whether m, in a function shaped like append, is
+// that function growing what it appends to as append does: made as long as
+// a slice it holds as reused memory, which it then copies into it.
+func (c *checker) growsOwnByHand(m *ssa.MakeSlice) bool {
+	fn := m.Parent()
+	if !c.appendRoot(fn) {
+		return false
+	}
+	n, isCall := m.Len.(*ssa.Call)
+	if !isCall {
+		return false
+	}
+	if b, isBuiltin := n.Call.Value.(*ssa.Builtin); !isBuiltin || b.Name() != "len" || !c.reused(n.Call.Args[0]) {
+		return false
+	}
+	from := n.Call.Args[0]
+	for _, r := range *m.Referrers() {
+		if cp, isCall := r.(*ssa.Call); isCall {
+			if b, isBuiltin := cp.Call.Value.(*ssa.Builtin); isBuiltin && b.Name() == "copy" &&
+				cp.Call.Args[0] == ssa.Value(m) && cp.Call.Args[1] == from {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// appendedMake reports whether m, with no capacity of its own, is written
+// as what a builtin append spreads onto a slice, append(s, make([]T, n)...),
+// which the compiler turns into growing s by n without making the slice.
+func (c *checker) appendedMake(m *ssa.MakeSlice) bool {
+	pos := m.Pos()
+	if m.Cap != m.Len || !pos.IsValid() {
+		return false
+	}
+	mk, outer := c.callAt(pos)
+	app, isCall := outer.(*ast.CallExpr)
+	if mk == nil || !isCall || !app.Ellipsis.IsValid() || len(app.Args) != 2 || app.Args[1] != mk {
+		return false
+	}
+	id, isIdent := app.Fun.(*ast.Ident)
+	return isIdent && id.Name == "append"
+}
+
+// callAt is the call whose open parenthesis is at pos, and the node that
+// holds it.
+func (c *checker) callAt(pos token.Pos) (*ast.CallExpr, ast.Node) {
+	f, _ := c.syntax(c.fset.Position(pos).Filename)
+	if f == nil {
+		return nil, nil
+	}
+	path, _ := astutil.PathEnclosingInterval(f, pos, pos)
+	for i, n := range path {
+		if call, isCall := n.(*ast.CallExpr); isCall && call.Lparen == pos && i+1 < len(path) {
+			return call, path[i+1]
+		}
+	}
+	return nil, nil
 }
 
 // instrAllocs returns why in allocates, if it does.
@@ -1944,15 +2671,15 @@ func (c *checker) instrAllocs(in ssa.Instruction) []string {
 			out = append(out, "map write that may grow reused memory")
 		}
 	case *ssa.BinOp:
-		if in.Op == token.ADD && isString(in.Type()) {
+		if in.Op == token.ADD && isString(in.Type()) && !c.concatOperand(in) {
 			out = append(out, "string concatenation")
 		}
 	case *ssa.Convert:
-		if conv := stringConversion(in); conv != "" && !compilerAvoidsCopy(in) {
+		if conv := stringConversion(in); conv != "" && !compilerAvoidsCopy(in) && !c.rangedOver(in) {
 			out = append(out, conv)
 		}
 	case *ssa.MakeSlice:
-		if !isConst(in.Len) || !isConst(in.Cap) {
+		if (!isConst(in.Len) || !isConst(in.Cap)) && !c.appendedMake(in) && !c.growsOwnByHand(in) {
 			out = append(out, "make with a size known only at run time")
 		}
 	case *ssa.MakeMap:
@@ -1991,9 +2718,20 @@ func (c *checker) callAllocs(call ssa.CallInstruction) []string {
 	}
 	callees := c.expand(c.sites[call], map[*ssa.Function]bool{})
 	if len(callees) == 0 {
-		if desc := callDesc(cm); !c.allow.exact[desc] {
-			return []string{"call with no known callee: " + desc}
+		desc := callDesc(cm)
+		if s, ok := c.methodSummary(cm); ok {
+			// Every implementation is outside the module, and judged by
+			// its code, with no failure of theirs taken to end the call.
+			if !s.Alloc[0] || c.overridden(desc) {
+				return nil
+			}
+			c.noteWhy(call, s.Why[0])
+			return []string{"calls " + desc}
 		}
+		if c.overridden(desc) {
+			return nil
+		}
+		return []string{"call with no known callee: " + desc}
 	}
 	var out []string
 	for _, callee := range callees {
@@ -2005,23 +2743,96 @@ func (c *checker) callAllocs(call ssa.CallInstruction) []string {
 			}
 			continue
 		}
-		if c.ours(callee) {
+		// The module's Go functions are checked where they are defined; one
+		// with no Go body is judged by its machine code, as code outside is.
+		if c.ours(callee) && callee.Blocks != nil {
 			continue
 		}
-		name := funcName(callee)
-		if c.allow.appends[name] {
-			if dst := appendedTo(cm, callee); dst == nil || !c.reused(dst) {
-				out = append(out, "calls "+name)
-			} else if !c.ownAppendCall(call, dst) {
-				out = append(out, "calls "+name+", which may grow reused memory")
-			}
-			continue
-		}
-		if !c.allow.has(callee) {
-			out = append(out, "calls "+name)
-		}
+		out = append(out, c.summaryAllocs(call, callee, funcName(callee))...)
 	}
 	return out
+}
+
+// methodSummary is the summary of cm, a call of an interface method, as of
+// every implementation outside the module.
+func (c *checker) methodSummary(cm *ssa.CallCommon) (summary, bool) {
+	if !cm.IsInvoke() {
+		return summary{}, false
+	}
+	s, ok := c.sums[methodSummaryName(cm)]
+	return s, ok
+}
+
+// overridden reports whether an allowlist line covers the function or call
+// named name, which would allocate, and notes that the check relied on each
+// line that does.
+func (c *checker) overridden(name string) bool {
+	labels := allowLabels(c.allow.assumed, name)
+	for _, l := range labels {
+		c.allow.used[l] = true
+	}
+	return len(labels) > 0
+}
+
+// allowLabels are the lines of assumed that cover name, in order: name
+// itself, and each line ending in "*" whose text before it starts name.
+func allowLabels(assumed map[string]string, name string) []string {
+	var out []string
+	for label := range assumed {
+		p, pattern := strings.CutSuffix(label, "*")
+		if label == name || pattern && strings.HasPrefix(name, p) {
+			out = append(out, label)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// noteWhy records why call, judged by a summary, allocates.
+func (c *checker) noteWhy(call ssa.CallInstruction, why string) {
+	if c.callWhy == nil {
+		c.callWhy, c.whyAt = map[ssa.CallInstruction]string{}, map[site]string{}
+	}
+	c.callWhy[call] = why
+}
+
+// summaryAllocs is why call, to callee outside the module, allocates, as
+// callee's summary has it for the failures the call gives it.
+func (c *checker) summaryAllocs(call ssa.CallInstruction, callee *ssa.Function, name string) []string {
+	s, ok := c.sums[summaryName(callee)]
+	if !ok {
+		return []string{"calls " + name}
+	}
+	fn := call.Parent()
+	f := c.calleeFailures(fn, call, callee, c.blocks[fn])
+	if cl, isCall := call.(*ssa.Call); isCall && c.newError(cl) && !c.failureArm(cl.Block()) {
+		// An error made on a normal path is no failure's.
+		f &^= failErrors
+	}
+	alloc, why := s.Alloc[f], s.Why[f]
+	if pos := call.Common().Pos(); alloc && c.inlinedCalls[pos] && !s.Bare[f] && !c.inlinedEscapes[pos] {
+		// Inlined, the callee's own escapes are what the compiler reports
+		// at the call, and it reports none.
+		alloc = false
+	}
+	if !alloc {
+		return nil
+	}
+	if c.ours(callee) && c.overridden(name) {
+		// The summarizer applies the allowlist to code outside the
+		// module; the module's code with no Go body is judged here.
+		return nil
+	}
+	c.noteWhy(call, why)
+	if s.Shaped && s.Appends[f] {
+		if dst := appendedTo(call.Common(), callee); dst == nil || !c.reused(dst) {
+			return []string{"calls " + name}
+		} else if !c.ownAppendCall(call, dst) {
+			return []string{"calls " + name + ", which may grow reused memory"}
+		}
+		return nil
+	}
+	return []string{"calls " + name}
 }
 
 func callDesc(cm *ssa.CallCommon) string {
@@ -2169,6 +2980,20 @@ func compilerAvoidsCopy(in *ssa.Convert) bool {
 	return true
 }
 
+// rangedOver reports whether in converts a string to a byte slice as the
+// expression a for statement ranges over, which the compiler reads in place,
+// the string's bytes being immutable. Bytes converted to a string to range
+// over are copied, since the loop can change them.
+func (c *checker) rangedOver(in *ssa.Convert) bool {
+	pos := in.Pos()
+	if !pos.IsValid() || !isString(in.X.Type()) {
+		return false
+	}
+	call, outer := c.callAt(pos)
+	r, isRange := outer.(*ast.RangeStmt)
+	return call != nil && isRange && r.X == call
+}
+
 // scratchTypes returns the Scratch types and every struct type they hold by
 // value, or as the elements of a slice they hold, directly or by pointer, at
 // any depth.
@@ -2242,7 +3067,7 @@ func (c *checker) reusedUncached(v ssa.Value) bool {
 			return b.Name() == "append" && c.reused(v.Call.Args[0])
 		}
 		callee := v.Call.StaticCallee()
-		if callee != nil && (c.allow.appends[funcName(callee)] || c.appendRoot(callee)) {
+		if callee != nil && (c.appendRoot(callee) || c.returnsAppended(callee)) {
 			dst := appendedTo(&v.Call, callee)
 			return dst != nil && c.reused(dst)
 		}
@@ -2263,8 +3088,23 @@ func (c *checker) reusedUncached(v ssa.Value) bool {
 		return callee != nil && c.ours(callee) && callee.Blocks != nil && c.returnsReused(callee, v.Index)
 	case *ssa.Parameter:
 		return c.paramReused(v)
+	case *ssa.MakeSlice:
+		// Reused memory grown by hand is reused memory still.
+		return c.growsOwnByHand(v)
 	}
 	return false
+}
+
+// returnsAppended reports whether callee, outside the module and shaped
+// like append, returns its first argument appended to, as its summary has
+// it: every return is, whatever else it allocates, or, handed reused memory,
+// it allocates nothing but to grow it.
+func (c *checker) returnsAppended(callee *ssa.Function) bool {
+	if c.appended != nil {
+		return c.appended(callee)
+	}
+	s, ok := c.sums[summaryName(callee)]
+	return ok && s.Shaped && (s.Returns || s.Appends[failOnce])
 }
 
 func (c *checker) returnsReused(fn *ssa.Function, idx int) bool {
@@ -2443,7 +3283,7 @@ type span struct {
 
 // matchEscapes adds each heap escape the compiler reported inside a reached
 // function of the module, on a line its normal path runs.
-func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, token.Position, string)) {
+func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, site)) {
 	byFile := map[string][]span{}
 	reached := map[ast.Node][]*ssa.Function{}
 	for _, fn := range append(slices.Clone(c.order), c.coverOrder...) {
@@ -2483,7 +3323,7 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 			continue
 		}
 		pos := tf.LineStart(e.line) + token.Pos(e.col-1)
-		if !e.inlined && constantText(e.msg) && c.constantAt(e.file, pos) {
+		if !e.inlined && (constantText(e.msg) && c.constantAt(e.file, pos) || c.boxedFreeAt(e.file, pos, e.msg) || c.handGrownAt(e.file, e.line, e.msg)) {
 			continue
 		}
 		if e.inlined {
@@ -2514,7 +3354,7 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 		}
 		if i, ok := c.exemptionAt[e.file][e.line]; ok && c.exempt[e.file][e.line] {
 			c.exemptions[i].Reached = true
-			c.addCover(i, in.fns[0], "escapes: "+e.msg)
+			c.addCover(i, in.fns[0], e.site())
 			continue
 		}
 		// The escape is on the normal path when a function that runs its line
@@ -2552,7 +3392,7 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 		if fn == nil {
 			fn = in.fns[0]
 		}
-		add(fn, token.Position{Filename: e.file, Line: e.line}, "escapes: "+e.msg)
+		add(fn, e.site())
 	}
 }
 
@@ -2594,11 +3434,54 @@ func constantForm(e ast.Expr) bool {
 	return false
 }
 
+// posOf is the position of e, a place the compiler reports, in a file of
+// the program.
+func (c *checker) posOf(e escape) (token.Pos, bool) {
+	f, _ := c.syntax(e.file)
+	if f == nil {
+		return token.NoPos, false
+	}
+	tf := c.fset.File(f.Pos())
+	if e.line > tf.LineCount() {
+		return token.NoPos, false
+	}
+	return tf.LineStart(e.line) + token.Pos(e.col-1), true
+}
+
+// inlinedEscapes are the escapes of es the compiler reports at a call it
+// inlined, other than a constant's, which is read-only data.
+func inlinedEscapes(es []escape) []escape {
+	var out []escape
+	for _, e := range es {
+		if e.inlined && !constantText(e.msg) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// positions is the set of the places of es.
+func (c *checker) positions(es []escape) map[token.Pos]bool {
+	out := map[token.Pos]bool{}
+	for _, e := range es {
+		if pos, ok := c.posOf(e); ok {
+			out[pos] = true
+		}
+	}
+	return out
+}
+
+// syntax is the syntax and type information of the file at path.
+func (c *checker) syntax(path string) (*ast.File, *types.Info) {
+	path = filepath.Clean(path)
+	return c.files[path], c.fileInfo[path]
+}
+
 // constantAt reports whether the expression the compiler reports an escape
 // of at pos in file is a constant, which the compiler converts to an
 // interface as read-only data: the escape allocates nothing.
 func (c *checker) constantAt(file string, pos token.Pos) bool {
-	f, info := c.files[file], c.fileInfo[file]
+	f, info := c.syntax(file)
 	if f == nil || info == nil {
 		return false
 	}
@@ -2617,6 +3500,74 @@ func (c *checker) constantAt(file string, pos token.Pos) bool {
 	}
 	return false
 }
+
+// boxedFreeAt reports whether what the compiler reports with msg as escaping
+// at pos in file is a value an interface can point at the runtime's own memory
+// for, so boxing it allocates nothing: a value of a type with no size, or a
+// one-byte integer or a bool, which the runtime keeps a table of.
+func (c *checker) boxedFreeAt(file string, pos token.Pos, msg string) bool {
+	if !strings.HasSuffix(msg, " escapes to heap") {
+		return false
+	}
+	f, info := c.syntax(file)
+	if f == nil || info == nil {
+		return false
+	}
+	path, _ := astutil.PathEnclosingInterval(f, pos, pos)
+	for i, n := range path {
+		e, isExpr := n.(ast.Expr)
+		if !isExpr || i > 0 && e.Pos() != pos {
+			break
+		}
+		t := info.TypeOf(e)
+		if t == nil || hasTypeParam(t, map[types.Type]bool{}) {
+			continue
+		}
+		// The compiler can report an escape at an operand, as it reports
+		// string(c) at c, so only the expression the message names counts.
+		named := types.ExprString(e)+" escapes to heap" == msg
+		if b, ok := t.Underlying().(*types.Basic); ok && named && (b.Info()&types.IsBoolean != 0 || b.Info()&types.IsInteger != 0 && zeroSize.Sizeof(b) == 1) {
+			return true
+		}
+		if zeroSize.Sizeof(t) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTypeParam reports whether t holds a type parameter, whose size is
+// known only once it is instantiated.
+func hasTypeParam(t types.Type, seen map[types.Type]bool) bool {
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	switch t := types.Unalias(t).(type) {
+	case *types.TypeParam:
+		return true
+	case *types.Named:
+		for i := range t.TypeArgs().Len() {
+			if hasTypeParam(t.TypeArgs().At(i), seen) {
+				return true
+			}
+		}
+		return t.TypeParams().Len() > 0 && t.TypeArgs().Len() == 0 || hasTypeParam(t.Underlying(), seen)
+	case *types.Array:
+		return hasTypeParam(t.Elem(), seen)
+	case *types.Struct:
+		for i := range t.NumFields() {
+			if hasTypeParam(t.Field(i).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// zeroSize measures types for boxedFreeAt: a type has no size on one
+// platform when it has none on every one.
+var zeroSize = types.SizesFor("gc", "amd64")
 
 // staticCallees maps the position of each call in the module, its opening
 // parenthesis as the compiler reports an inlined call at, to its callee.
@@ -2757,6 +3708,12 @@ type escape struct {
 	// inlined is an escape at a call the compiler inlined, where it reports
 	// the inlined body's escapes as well as the caller's own.
 	inlined bool
+	// nth tells apart escapes an inlined body reports at one call.
+	nth int
+}
+
+func (e escape) site() site {
+	return site{pos: token.Position{Filename: e.file, Line: e.line, Column: e.col}, nth: e.nth, reason: "escapes: " + e.msg}
 }
 
 var diagLine = regexp.MustCompile(`^(.+\.go):(\d+):(\d+): (.*)$`)
@@ -2764,37 +3721,38 @@ var diagLine = regexp.MustCompile(`^(.+\.go):(\d+):(\d+): (.*)$`)
 // compilerEscapes builds each pattern with the compiler's escape report and
 // assembly for the module's packages, and returns the heap allocations it
 // reports and the runtime calls their compiled code makes.
-func compilerEscapes(cfg Config, env []string) ([]escape, []escape, *asmReader, error) {
-	var escapes, notes []escape
+func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport, error) {
+	var escapes, notes, inlines []escape
 	asm := &asmReader{seen: map[string]bool{}, starts: map[string]asmPos{}}
 	seen := map[escape]bool{}
 	var overlay []string
 	if len(cfg.Overlay) > 0 {
 		dir, err := os.MkdirTemp("", "noalloc-overlay")
 		if err != nil {
-			return nil, nil, nil, err
+			return compilerReport{}, err
 		}
 		defer os.RemoveAll(dir)
-		replace := map[string]string{}
-		for path, b := range cfg.Overlay {
-			f := filepath.Join(dir, strconv.Itoa(len(replace))+".go")
-			if err := os.WriteFile(f, b, 0o644); err != nil {
-				return nil, nil, nil, err
-			}
-			replace[path] = f
-		}
-		j, _ := json.Marshal(map[string]any{"Replace": replace})
-		f := filepath.Join(dir, "overlay.json")
-		if err := os.WriteFile(f, j, 0o644); err != nil {
-			return nil, nil, nil, err
+		f, err := writeOverlay(dir, cfg.Overlay)
+		if err != nil {
+			return compilerReport{}, err
 		}
 		overlay = []string{"-overlay", f}
 	}
+	goenv := exec.Command("go", "env", "GOROOT", "GOMODCACHE")
+	goenv.Dir, goenv.Env = cfg.Dir, env
+	roots, err := goenv.Output()
+	if err != nil {
+		return compilerReport{}, err
+	}
+	paths := map[string]string{}
 	const flags = "-m -S"
 	for _, pat := range cfg.Patterns {
 		args := append([]string{"build"}, overlay...)
-		for _, m := range append([]string{cfg.Module}, cfg.SourceModules...) {
-			args = append(args, "-gcflags="+m+"/...="+flags)
+		args = append(args, gcflags...)
+		if gcflags == nil {
+			for _, m := range append([]string{cfg.Module}, cfg.SourceModules...) {
+				args = append(args, "-gcflags="+m+"/...="+flags)
+			}
 		}
 		args = append(args, "-o", os.DevNull, pat)
 		cmd := exec.Command("go", args...)
@@ -2804,7 +3762,7 @@ func compilerEscapes(cfg Config, env []string) ([]escape, []escape, *asmReader, 
 		pr, pw := io.Pipe()
 		cmd.Stdout, cmd.Stderr = pw, pw
 		if err := cmd.Start(); err != nil {
-			return nil, nil, nil, err
+			return compilerReport{}, err
 		}
 		waited := make(chan error, 1)
 		go func() {
@@ -2815,7 +3773,9 @@ func compilerEscapes(cfg Config, env []string) ([]escape, []escape, *asmReader, 
 		var last []string
 		// The compiler reports an inlined body's escapes at the call it was
 		// inlined into; the body's own compile reports them at their lines.
-		inlined := map[escape]bool{}
+		// It reports each once for each time it inlines the call, once in
+		// each shape a generic caller compiles to.
+		inlined := map[escape]int{}
 		var found []escape
 		sc := bufio.NewScanner(pr)
 		sc.Buffer(make([]byte, 1<<20), 1<<20)
@@ -2829,19 +3789,23 @@ func compilerEscapes(cfg Config, env []string) ([]escape, []escape, *asmReader, 
 			if m == nil {
 				continue
 			}
-			file := m[1]
-			if !filepath.IsAbs(file) {
-				file = filepath.Join(cfg.Dir, file)
+			file, ok := paths[m[1]]
+			if !ok {
+				file = reportedFile(m[1], cfg.Dir, append(strings.Fields(string(roots)), cfg.Dir, cfg.Root))
+				paths[m[1]] = file
 			}
 			line, _ := strconv.Atoi(m[2])
 			col, _ := strconv.Atoi(m[3])
-			at, msg := escape{file: filepath.Clean(file), line: line, col: col}, m[4]
+			at, msg := escape{file: file, line: line, col: col}, m[4]
 			if !strings.HasPrefix(msg, "inlining call to ") && !strings.HasPrefix(msg, "can inline ") {
 				notes = append(notes, at)
 			}
 			switch {
 			case strings.HasPrefix(msg, "inlining call to "):
-				inlined[at] = true
+				if inlined[at] == 0 {
+					inlines = append(inlines, at)
+				}
+				inlined[at]++
 			case msg == "append escapes to heap":
 				// A growing append is the append rule's, which knows the Scratch.
 			case strings.HasPrefix(msg, "moved to heap: "), strings.HasSuffix(msg, " escapes to heap"):
@@ -2852,20 +3816,88 @@ func compilerEscapes(cfg Config, env []string) ([]escape, []escape, *asmReader, 
 		scanErr := sc.Err()
 		io.Copy(io.Discard, pr)
 		if err := <-waited; err != nil {
-			return nil, nil, nil, fmt.Errorf("go %s: %v\n%s", strings.Join(args, " "), err, tail(strings.Join(last, "\n"), 2000))
+			return compilerReport{}, fmt.Errorf("go %s: %v\n%s", strings.Join(args, " "), err, tail(strings.Join(last, "\n"), 2000))
 		}
 		if scanErr != nil {
-			return nil, nil, nil, scanErr
+			return compilerReport{}, scanErr
 		}
+		reports := map[escape]int{}
 		for _, e := range found {
-			e.inlined = inlined[escape{file: e.file, line: e.line, col: e.col}]
+			n := inlined[escape{file: e.file, line: e.line, col: e.col}]
+			e.inlined = n > 0
+			if e.inlined {
+				// Of the n reports of each escape in an inlined body, the
+				// first stands for the body's first allocation of that text.
+				e.nth = reports[e] / n
+				reports[e]++
+			}
 			if !seen[e] {
 				seen[e] = true
 				escapes = append(escapes, e)
 			}
 		}
 	}
-	return escapes, notes, asm, nil
+	return compilerReport{escapes, notes, inlines, asm}, nil
+}
+
+// compilerReport is what compilerEscapes reads off the compiler: its
+// escapes; notes, where it reported anything of its escape analysis; inlines,
+// where it inlined a call; and the assembly it printed.
+type compilerReport struct {
+	escapes, notes, inlines []escape
+	asm                     *asmReader
+}
+
+// reportedFile is the file at path, as the compiler's report gives it, built
+// in dir. The build cache replays a report as the compile that wrote it
+// printed it, relative to the directory that compile ran in, so a relative
+// path dir does not hold is found under an ancestor of one of roots.
+func reportedFile(path, dir string, roots []string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	joined := filepath.Join(dir, path)
+	if _, err := os.Stat(joined); err == nil {
+		return joined
+	}
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	for len(parts) > 1 && (parts[0] == ".." || parts[0] == ".") {
+		parts = parts[1:]
+	}
+	rest := filepath.Join(parts...)
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		for a := root; ; a = filepath.Dir(a) {
+			p := filepath.Join(a, rest)
+			if strings.HasPrefix(p, root+string(filepath.Separator)) {
+				if _, err := os.Stat(p); err == nil {
+					return p
+				}
+			}
+			if filepath.Dir(a) == a {
+				break
+			}
+		}
+	}
+	return joined
+}
+
+// writeOverlay writes files into dir with an overlay file, as go build
+// -overlay takes, that puts each in place of its path, and returns that file.
+func writeOverlay(dir string, files map[string][]byte) (string, error) {
+	replace := map[string]string{}
+	for path, b := range files {
+		f := filepath.Join(dir, strconv.Itoa(len(replace))+".go")
+		if err := os.WriteFile(f, b, 0o644); err != nil {
+			return "", err
+		}
+		replace[path] = f
+	}
+	j, _ := json.Marshal(map[string]any{"Replace": replace})
+	f := filepath.Join(dir, "overlay.json")
+	return f, os.WriteFile(f, j, 0o644)
 }
 
 // foldShapes replaces each generic type argument list the compiler names a
@@ -2902,46 +3934,39 @@ func tail(s string, n int) string {
 	return s
 }
 
-// allowlist matches functions outside the module known not to allocate,
-// and, in appends, those that append to their first argument and return it
-// as the builtin append does.
+// allowlist matches the functions and calls a check takes to allocate
+// nothing although their code does not show it.
 type allowlist struct {
-	exact    map[string]bool
-	prefixes []string
-	appends  map[string]bool
+	// assumed holds each overridden function's kind, by its name as
+	// funcName has it or a pattern ending in "*", and used the ones a check
+	// relied on.
+	assumed map[string]string
+	used    map[string]bool
 }
 
-func parseAllow(lines []string) allowlist {
-	a := allowlist{exact: map[string]bool{}, appends: map[string]bool{}}
+// parseAllow reads allowlist lines, each "kind: function" with an optional
+// "# comment"; a line of any other form is an error.
+func parseAllow(lines []string) (allowlist, error) {
+	a := allowlist{assumed: map[string]string{}, used: map[string]bool{}}
+	var bad []string
 	for _, l := range lines {
 		if i := strings.Index(l, "#"); i >= 0 {
 			l = l[:i]
 		}
 		l = strings.TrimSpace(l)
-		switch {
-		case l == "":
-		case strings.HasPrefix(l, "append:"):
-			a.appends[strings.TrimSpace(strings.TrimPrefix(l, "append:"))] = true
-		case strings.HasSuffix(l, ".*"):
-			a.prefixes = append(a.prefixes, strings.TrimSuffix(l, "*"))
-		default:
-			a.exact[l] = true
+		if l == "" {
+			continue
 		}
-	}
-	return a
-}
-
-func (a allowlist) has(fn *ssa.Function) bool { return a.hasName(funcName(fn)) }
-
-// hasName reports whether the function SSA names name is on the list.
-func (a allowlist) hasName(name string) bool {
-	if a.exact[name] {
-		return true
-	}
-	for _, p := range a.prefixes {
-		if strings.HasPrefix(name, p) {
-			return true
+		kind, fn, labeled := strings.Cut(l, ":")
+		if !labeled || !slices.Contains(assumptionKinds, kind) || strings.TrimSpace(fn) == "" {
+			bad = append(bad, l)
+			continue
 		}
+		a.assumed[strings.TrimSpace(fn)] = kind
 	}
-	return false
+	if len(bad) > 0 {
+		return a, fmt.Errorf("an allowlist line names a function and the kind of reason it allocates nothing, as \"kind: function\" with a kind of %s; what a function allocates is worked out from its code otherwise: %s",
+			strings.Join(assumptionKinds, ", "), strings.Join(bad, "; "))
+	}
+	return a, nil
 }

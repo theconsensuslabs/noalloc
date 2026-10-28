@@ -298,6 +298,11 @@ func (c *checker) fromFirstParam(fn *ssa.Function, v ssa.Value, seen map[ssa.Val
 		return v == fn.Params[len(fn.Params)-fn.Signature.Params().Len()]
 	case *ssa.Slice:
 		return c.fromFirstParam(fn, v.X, seen)
+	case *ssa.MakeSlice:
+		// Grown by hand from a slice it copies.
+		if l, isCall := v.Len.(*ssa.Call); isCall && c.growsOwnByHand(v) {
+			return c.fromFirstParam(fn, l.Call.Args[0], seen)
+		}
 	case *ssa.Phi:
 		for _, e := range v.Edges {
 			if !c.fromFirstParam(fn, e, seen) {
@@ -310,7 +315,7 @@ func (c *checker) fromFirstParam(fn *ssa.Function, v ssa.Value, seen map[ssa.Val
 		if b, ok := cm.Value.(*ssa.Builtin); ok {
 			return b.Name() == "append" && len(cm.Args) > 0 && c.fromFirstParam(fn, cm.Args[0], seen)
 		}
-		if callee := cm.StaticCallee(); callee != nil && (c.appendRoot(callee) || c.allow.appends[funcName(callee)]) {
+		if callee := cm.StaticCallee(); callee != nil && (c.appendRoot(callee) || c.returnsAppended(callee)) {
 			if dst := appendedTo(cm, callee); dst != nil {
 				return c.fromFirstParam(fn, dst, seen)
 			}

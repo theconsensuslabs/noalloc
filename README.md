@@ -36,7 +36,7 @@ func (c *Counter) Add(name string, n int) string {
 ```
 $ noalloc
 counter.go:11: (*example.com/counter.Counter).Add: map write
-counter.go:12: (*example.com/counter.Counter).Add: string concatenation; calls strconv.Itoa
+counter.go:12: (*example.com/counter.Counter).Add: calls strconv.Itoa; string concatenation; escapes: name + "=" + ~r0 escapes to heap
 ```
 
 noalloc exits 1 (it found an allocation) or 2 (it couldn't run at all). It
@@ -56,13 +56,15 @@ first-use setup, which the caveats below cover.
 Reused memory is memory kept between requests, such as a buffer in a
 long-lived struct. An append to it is only allowed after a comparison proves
 there's room. You can also mark a type's fields as reused memory with
-`-scratch pkg/path.Type`. A call to a function outside your module is only
-allowed if it's in noalloc's built-in [allowlist](allow.txt) or a file you
-pass with `-allow`, or in packages you check from source with `-source`,
-which takes an import path prefix. Check noalloc's own libraries that way:
+`-scratch pkg/path.Type`. A call to a function outside your module is
+allowed when that function's own code allocates nothing, which noalloc works
+out from its source, or from its compiled code when it's written in assembly
+or is part of the runtime. Packages you check from source with `-source`,
+which takes an import path prefix, are checked as part of your module
+instead. Check noalloc's own libraries that way:
 `-source github.com/theconsensuslabs/noalloc/bounded`, and the same for
-`encoding/json`, so their code is checked in your run rather than vouched
-for. Run `noalloc -h` for every flag.
+`encoding/json`, so their `//noalloc:fixed` types and other directives count,
+which they don't in code outside your module. Run `noalloc -h` for every flag.
 
 ## Designing with bounded
 
@@ -456,8 +458,9 @@ The first call to `Done` on a cancelable context allocates its channel:
 bounded.Reserve(ctx.Done(), &r, pool, 1) // one allocation
 ```
 
-Pass a channel you make once instead, such as one your server closes on
-shutdown.
+noalloc counts this as [first-use setup](#first-use-setup) and doesn't
+report it, but every new context allocates its own. Pass a channel you make
+once instead, such as one your server closes on shutdown.
 
 ### Expecting zeroed chunks
 
@@ -501,17 +504,19 @@ nothing through fails as well: delete it.
 
 ### Functions written in assembly
 
-noalloc assumes a function with no Go body allocates nothing:
+noalloc judges a function with no Go body by its compiled code: it follows the
+calls in it to the runtime's allocator. A call through a register can't be
+followed, so a function that makes one counts as allocating:
 
 ```go
 func sum(xs []int) int // written in sum_arm64.s
 
 //noalloc:root
-func Total(xs []int) int { return sum(xs) } // noalloc reports nothing
+func Total(xs []int) int { return sum(xs) } // reported only if sum's code can reach the allocator
 ```
 
-noalloc reads the compiler's assembly, not your `.s` files, so test these
-functions with `alloctest.Zero`. It runs the function through
+When noalloc can't follow a function you know allocates nothing, list it as
+`measured` and test it with `alloctest.Zero`. It runs the function through
 `testing.AllocsPerRun`, fails when the count isn't zero, and skips the test
 under `-race`, which allocates for its own bookkeeping:
 
@@ -520,6 +525,22 @@ func TestSumAllocatesNothing(t *testing.T) {
 	xs := []int{1, 2, 3}
 	alloctest.Zero(t, "sum", func() { sum(xs) })
 }
+```
+
+### Calls out of your module
+
+noalloc works out what each function outside your module allocates from the
+code your build compiles, and caches it in a `noalloc` directory in your user
+cache, one file for each build. The first run on a new toolchain, platform,
+set of build tags, or set of dependency versions works it out again, and
+takes longer than later runs: on The Consensus's server, 39 seconds against
+4. A function it can't follow, such as one that calls through a function
+value, counts as allocating, and `-report` gives the chain of calls that led
+to the allocation under each finding:
+
+```
+counter.go:12: (*example.com/counter.Counter).Add: calls strconv.Itoa; string concatenation; escapes: name + "=" + ~r0 escapes to heap
+    because strconv.Itoa calls internal/strconv.Itoa at number.go:215 > internal/strconv.Itoa calls internal/strconv.FormatInt at itoa.go:53 > internal/strconv.FormatInt calls internal/strconv.formatBits at itoa.go:47 > internal/strconv.formatBits: string([]byte) conversion at itoa.go:146
 ```
 
 ### The compiler's output
@@ -536,15 +557,26 @@ toolchain go1.27.0
 
 ### What noalloc trusts
 
-noalloc trusts the allowlist, `//noalloc:fixed`, and every exemption without
-verifying them. If a file you pass with `-allow` lists a function that does allocate,
-noalloc won't notice:
+noalloc trusts its allowlist, `//noalloc:fixed`, and every exemption without
+verifying them. The allowlist is a built-in [list](allow.txt) plus the files
+you pass with `-allow`, and it only overrides what noalloc works out: each line
+names a function and why it can be taken to allocate nothing even though its
+code doesn't show it. The reason is one of these:
+
+- `amortized`: it allocates only to grow memory the runtime keeps and reuses,
+  such as the cache a blocked `sync.Mutex` takes its waiter from.
+- `measured`: its code can't be followed, and a test that calls it counts no
+  allocation.
+- `debug` or `profiling`: it allocates only on a path that runs to debug or
+  profile.
 
 ```
-example.com/fmtx.Format
+measured: example.com/fmtx.Format
 ```
 
-So write a test for each function you add:
+The built-in list takes `sync`'s locks and wait groups as `amortized`.
+`-report` lists every line and says which ones no check relied on. For a
+`measured` line, write the test:
 
 ```go
 func TestFormatAllocatesNothing(t *testing.T) {
@@ -649,7 +681,7 @@ not.
 ### First-use setup
 
 noalloc allows a branch that finds a field or package variable nil and sets
-it:
+it, directly or through `sync/atomic`:
 
 ```go
 if p.index == nil {

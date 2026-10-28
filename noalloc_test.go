@@ -1,6 +1,7 @@
 package noalloc
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -445,4 +446,425 @@ func coveredParse(s string) (int, error) {
 		}
 	}
 	t.Fatal("no exemption covers the loop")
+}
+
+// TestARelativeDirFindsWhatAnAbsoluteOneDoes checks that Check finds the same
+// allocations, reported against the same files, when Dir and Root are
+// relative to the working directory.
+func TestARelativeDirFindsWhatAnAbsoluteOneDoes(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(dir string) []string {
+		t.Helper()
+		res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+			LineOnly: []string{"response"},
+			Allow:    strings.Split(Allowlist, "\n"), Root: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, f := range res.Findings {
+			out = append(out, f.String())
+		}
+		return out
+	}
+	abs := run(dir)
+	if !slices.ContainsFunc(abs, func(f string) bool { return strings.Contains(f, "escapes: ") }) {
+		t.Fatal("control: the fixture has no escape")
+	}
+	for _, d := range []string{"testdata/fixture", "./testdata/../testdata/./fixture", dir + "/../fixture/."} {
+		if got := run(d); !slices.Equal(abs, got) {
+			t.Errorf("with Dir %s, findings\n%s\nwant\n%s", d, strings.Join(got, "\n"), strings.Join(abs, "\n"))
+		}
+	}
+}
+
+// repeats is a root whose lines each allocate twice for one reason: in an
+// escape, a call, an inlined closure, a generic body compiled for two shapes,
+// and an exempt line. A chain of concatenations, which compiles to one, and a
+// map literal's entries, which fill one map, allocate once.
+const repeats = `
+var boxed1, boxed2 any
+
+//go:noinline
+func box2(a, b any) { boxed1, boxed2 = a, b }
+
+//noalloc:root
+func Repeats(x int) {
+	box2(x, x)
+	_, _ = strconv.Itoa(x), strconv.Itoa(x)
+	_ = strconv.Itoa(x) + "!" + strconv.Itoa(x)
+	s := strconv.Itoa(x) + "!"
+	_ = s + "?"
+	s += "(" + s + ")"
+	func() { box2(x, x) }()
+	boxTwice(x)
+	boxTwice(int64(x))
+	boxed1 = map[string]int{"a": x, "b": x}
+	_, _ = strconv.Quote(s), strconv.Quote(s) //noalloc:exempt setup: two calls
+}
+
+//go:noinline
+func boxTwice[T int | int64](v T) { box2(v, v) }
+`
+
+func checkRepeats(t *testing.T) (*Result, string) {
+	t.Helper()
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		LineOnly: []string{"response"},
+		Allow:    strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(string(src) + repeats)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res, dir
+}
+
+// TestEachAllocationOnALineIsCounted checks that a line allocating twice for
+// one reason lists that reason twice, for an escape and for a call, and that a
+// chain of concatenations lists one.
+func TestEachAllocationOnALineIsCounted(t *testing.T) {
+	res, _ := checkRepeats(t)
+	got := map[string][]string{}
+	for _, f := range res.Findings {
+		if f.Func == "fixture.Repeats" || strings.HasPrefix(f.Func, "fixture.boxTwice") {
+			got[f.Source] = append(got[f.Source], f.Reasons...)
+		}
+	}
+	want := map[string][]string{
+		"box2(x,x)":                                  {"escapes: x escapes to heap", "escapes: x escapes to heap"},
+		"_,_=strconv.Itoa(x),strconv.Itoa(x)":        {"calls strconv.Itoa", "calls strconv.Itoa"},
+		`_=strconv.Itoa(x)+"!"+strconv.Itoa(x)`:      {"calls strconv.Itoa", "calls strconv.Itoa", "string concatenation"},
+		`s:=strconv.Itoa(x)+"!"`:                     {"calls strconv.Itoa", "string concatenation"},
+		`_=s+"?"`:                                    {"string concatenation"},
+		`s+="("+s+")"`:                               {"string concatenation"},
+		`func(){box2(x,x)}()`:                        {"escapes: x escapes to heap in the inlined fixture.Repeats$1", "escapes: x escapes to heap in the inlined fixture.Repeats$1"},
+		`func boxTwice[T int|int64](v T){box2(v,v)}`: {"escapes: v escapes to heap", "escapes: v escapes to heap"},
+		`boxed1=map[string]int{"a":x,"b":x}`:         {"escapes: map[string]int{...} escapes to heap", "map write"},
+	}
+	for src, w := range want {
+		g := slices.Sorted(slices.Values(got[src]))
+		if !slices.Equal(g, w) {
+			t.Errorf("%s: reasons %q, want %q", src, g, w)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("lines %q, want those of %q", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+	}
+	i := slices.IndexFunc(res.Exemptions, func(e Exemption) bool { return e.Reason == "setup: two calls" })
+	if i < 0 {
+		t.Fatal("no exemption setup: two calls")
+	}
+	if c, w := res.Exemptions[i].Covers, []string{"fixture.Repeats: calls strconv.Quote", "fixture.Repeats: calls strconv.Quote"}; !slices.Equal(c, w) {
+		t.Errorf("the exemption covers %q, want %q", c, w)
+	}
+}
+
+// TestARestatementThatAddsAnAllocationIsDrift checks that a listed line
+// reworded to allocate once more for the same reason is a new allocation, not
+// only a restatement.
+func TestARestatementThatAddsAnAllocationIsDrift(t *testing.T) {
+	res, _ := checkRepeats(t)
+	base := filepath.Join(t.TempDir(), "base.txt")
+	r := Ratchet{Baselines: []Baseline{{"", base}}}
+	var listed []string
+	for _, l := range r.Lines(res, "") {
+		if l.Func == "fixture.Repeats" && l.Source == "box2(x,x)" {
+			continue
+		}
+		listed = append(listed, l.Key())
+	}
+	listed = append(listed, "fixture.go | fixture.Repeats | escapes: x escapes to heap | box2(x,nil)")
+	writeFile(t, base, strings.Join(listed, "\n")+"\n")
+	d, err := r.Compare(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := d.Baselines[0]
+	if len(b.Restated) != 1 || len(b.Added) != 1 || b.Added[0].Source != "box2(x,x)" || len(b.Stale) != 0 || d.Clean() {
+		t.Errorf("added %v, stale %v, restated %v, clean %v; want box2(x,x) added once and restated once",
+			b.Added, b.Stale, b.Restated, d.Clean())
+	}
+}
+
+// TestAConversionRangedOverIsNotACopy checks that converting a string to
+// bytes to range over is not a copy, as the compiler makes none, and that
+// converting bytes to a string to range over, or ranging over a conversion
+// kept in a variable, is.
+func TestAConversionRangedOverIsNotACopy(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := `
+//noalloc:root
+func RangeConverted(s string, b []byte) int {
+	n := 0
+	for _, c := range []byte(s) {
+		n += int(c)
+	}
+	for range string(b) {
+		n++
+	}
+	kept := []byte(s)
+	for _, c := range kept {
+		n += int(c)
+	}
+	return n + len(kept)
+}
+`
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(string(src) + add)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range res.Findings {
+		if f.Func == "fixture.RangeConverted" {
+			got[f.Source] = true
+		}
+	}
+	for src, want := range map[string]bool{"for _,c:=range[]byte(s){": false, "for range string(b){": true, "kept:=[]byte(s)": true} {
+		if got[src] != want {
+			t.Errorf("%s flagged %v, want %v", src, got[src], want)
+		}
+	}
+	// The compiled code agrees: it makes no allocating call noalloc missed.
+	for _, c := range res.CrossCheck.Calls {
+		if strings.Contains(c.String(), "RangeConverted") {
+			t.Errorf("the compiled code allocates where noalloc found nothing: %s", c)
+		}
+	}
+}
+
+// TestBoxingAValueTheRuntimeHoldsIsNotAnAllocation checks that boxing a
+// value of a type with no size, a one-byte integer, or a bool into an
+// interface, which the compiler reports as an escape but points at the
+// runtime's memory, is not a finding, and that the compiled code agrees.
+func TestBoxingAValueTheRuntimeHoldsIsNotAnAllocation(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := `
+type emptyErr struct{}
+
+func (emptyErr) Error() string { return "empty" }
+
+type byteErr byte
+
+func (byteErr) Error() string { return "byte" }
+
+type wideErr uint16
+
+func (wideErr) Error() string { return "wide" }
+
+var boxedSink any
+var errSink error
+var strSink string
+
+//noalloc:root
+func BoxZeroSize(n int, b byte, ok bool, w uint16) {
+	boxedSink = struct{}{}
+	errSink = emptyErr{}
+	errSink = byteErr(b)
+	boxedSink = ok
+	if n < 0 {
+		boxedSink = n
+	}
+	errSink = wideErr(w)
+	strSink = string(b)
+}
+`
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(string(src) + add)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range res.Findings {
+		if f.Func == "fixture.BoxZeroSize" {
+			got[f.Source] = true
+		}
+	}
+	for src, want := range map[string]bool{"boxedSink=struct{}{}": false, "errSink=emptyErr{}": false,
+		"errSink=byteErr(b)": false, "boxedSink=ok": false, "boxedSink=n": true, "errSink=wideErr(w)": true,
+		"strSink=string(b)": true} {
+		if got[src] != want {
+			t.Errorf("%s flagged %v, want %v", src, got[src], want)
+		}
+	}
+	for _, c := range res.CrossCheck.Calls {
+		if strings.Contains(c.String(), "BoxZeroSize") {
+			t.Errorf("the compiled code allocates where noalloc found nothing: %s", c)
+		}
+	}
+}
+
+// TestAppendingAMakeIsNoMake checks that append(s, make([]T, n)...), which
+// the compiler turns into growing s by n without making the slice, reports
+// no make, and that the compiled code agrees.
+func TestAppendingAMakeIsNoMake(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := `
+var extended []byte
+
+//noalloc:root
+func Extend(sc *Scratch, n int) {
+	sc.buf = append(sc.buf[:0], make([]byte, n)...)
+	kept := make([]byte, n)
+	extended = append(extended[:0], kept...)
+}
+`
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(string(src) + add)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, f := range res.Findings {
+		if f.Func == "fixture.Extend" {
+			got[f.Source] = f.Reasons
+		}
+	}
+	if r := got["sc.buf=append(sc.buf[:0],make([]byte,n)...)"]; slices.ContainsFunc(r, func(r string) bool { return strings.HasPrefix(r, "make") }) {
+		t.Errorf("appending a make reports a make: %q", r)
+	}
+	if r := got["kept:=make([]byte,n)"]; !slices.ContainsFunc(r, func(r string) bool { return strings.HasPrefix(r, "make") }) {
+		t.Errorf("a make kept in a variable reports no make: %q", r)
+	}
+	for _, c := range res.CrossCheck.Calls {
+		if strings.Contains(c.String(), "Extend") {
+			t.Errorf("the compiled code allocates where noalloc found nothing: %s", c)
+		}
+	}
+}
+
+// TestGrowingByHandIsGrowing checks a function shaped like append that grows
+// what it appends to by making a longer slice and copying into it: that make
+// grows reused memory, as append does, and what is appended after it is
+// still reused memory. The same make and copy elsewhere is a make.
+func TestGrowingByHandIsGrowing(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := `
+//noalloc:append
+func AppendByHand(dst []byte, s string) []byte {
+	if cap(dst)-len(dst) < len(s) {
+		grown := make([]byte, len(dst), len(dst)+len(s))
+		copy(grown, dst)
+		dst = grown
+	}
+	return append(dst, s...)
+}
+
+var handSink []byte
+
+//noalloc:root
+func CopyByHand(b []byte) {
+	c := make([]byte, len(b), 2*len(b))
+	copy(c, b)
+	handSink = c
+}
+`
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(string(src) + add)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range res.Findings {
+		if f.Func == "fixture.AppendByHand" {
+			t.Errorf("growing by hand allocates: %s", f)
+		}
+	}
+	if !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+		return f.Func == "fixture.CopyByHand" && slices.Contains(f.Reasons, "make with a size known only at run time")
+	}) {
+		t.Error("a make and copy outside a function shaped like append is no make")
+	}
+}
+
+// TestSetupThroughAnAtomicIsSetup checks that a value made the first time an
+// atomic field is found empty, and stored to it, is first-use setup, as one
+// stored to a plain field is, and that a value made each time is not.
+func TestSetupThroughAnAtomicIsSetup(t *testing.T) {
+	dir, err := filepath.Abs("testdata/fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "fixture.go")
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	over := strings.Replace(string(src), "import (\n", "import (\n\t\"sync/atomic\"\n", 1) + `
+type lazyDone struct{ done atomic.Value }
+
+//noalloc:root
+func (l *lazyDone) Done() chan struct{} {
+	d := l.done.Load()
+	if d == nil {
+		d = make(chan struct{})
+		l.done.Store(d)
+	}
+	return d.(chan struct{})
+}
+
+var everyTime atomic.Value
+
+//noalloc:root
+func MakeEachTime() {
+	everyTime.Store(make(chan struct{}))
+}
+`
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, Overlay: map[string][]byte{file: []byte(over)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range res.Findings {
+		if f.Func == "(*fixture.lazyDone).Done" && slices.Contains(f.Reasons, "make chan") {
+			t.Errorf("first-use setup through an atomic is a finding: %s", f)
+		}
+	}
+	if !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+		return f.Func == "fixture.MakeEachTime" && slices.Contains(f.Reasons, "make chan")
+	}) {
+		t.Error("a channel made on every call is no finding")
+	}
 }
