@@ -42,11 +42,14 @@ type summary struct {
 	// allocating: each covers a function the summary reached that would
 	// allocate without it.
 	Assumed []string `json:",omitempty"`
+	// NoImpl is, for a method call, that no type outside the module
+	// implements the method.
+	NoImpl bool `json:",omitempty"`
 }
 
 // summaryFormat names how summaries are worked out, so that a cache written
 // another way is not read.
-const summaryFormat = "4"
+const summaryFormat = "5"
 
 // testHookSummarize sees the functions each Check summarizes from source,
 // past what its cache held. Only tests set it.
@@ -73,15 +76,15 @@ func (c *checker) loadSummaries(env []string) error {
 			}
 		}
 	}
-	// A method call with no implementation in the module is judged by every
-	// one outside it.
+	// A method call VTA resolves to nothing is also judged by every
+	// implementation outside the module.
 	for _, fn := range append(slices.Clone(c.order), c.coverOrder...) {
 		if !c.ours(fn) {
 			continue
 		}
 		for _, b := range fn.Blocks {
 			for _, in := range b.Instrs {
-				if call, ok := in.(ssa.CallInstruction); ok && call.Common().IsInvoke() && len(c.expand(c.sites[call], map[*ssa.Function]bool{})) == 0 {
+				if call, ok := in.(ssa.CallInstruction); ok && c.open[call] {
 					need[methodSummaryName(call.Common())] = true
 				}
 			}
@@ -347,7 +350,7 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 	c := &checker{cfg: cfg, prog: prog, fset: prog.Fset, exempt: map[string]map[int]bool{}, lines: map[string][]string{},
 		appends: map[*ssa.Function]bool{}, fixed: map[types.Type]bool{}, marks: map[*ast.Comment]bool{},
 		lineState: map[string]map[int]uint8{}, moduleFiles: map[string]bool{}, inlinedBodies: map[*ssa.Function]bool{},
-		impls: map[string][]*ssa.Function{}, files: map[string]*ast.File{}, fileInfo: map[string]*types.Info{}}
+		impls: map[string][]*ssa.Function{}, open: map[ssa.CallInstruction]bool{}, files: map[string]*ast.File{}, fileInfo: map[string]*types.Info{}}
 	c.world = func(path string) bool { return !cfg.inModule(path) && !runtimePackage(path) }
 	for _, p := range pkgs {
 		if p.Types != nil {
@@ -494,9 +497,14 @@ func linknames(pkgs []*packages.Package) map[string]string {
 
 // methodSummaryName names the summary of a method call, as of every
 // implementation outside the module: "method: " and the interface, as its
-// type string, and the method, as in "method: context.Context Err".
+// type string, and the method, as in "method: context.Context Err". A call on
+// a type parameter is named by the parameter's constraint.
 func methodSummaryName(cm *ssa.CallCommon) string {
-	return "method: " + cm.Value.Type().String() + " " + cm.Method.Name()
+	t := cm.Value.Type()
+	if tp, ok := t.(*types.TypeParam); ok {
+		t = tp.Constraint()
+	}
+	return "method: " + t.String() + " " + cm.Method.Name()
 }
 
 // methodSummary summarizes a call of method of the named interface iface,
@@ -555,6 +563,7 @@ func (s *summarizer) methodSummary(pkgs []*packages.Package, iface, method strin
 			}
 		}
 	}
+	out.NoImpl = len(impls) == 0
 	for _, f := range failureContexts {
 		for _, fn := range impls {
 			if s.allocates(fn, f, false) {

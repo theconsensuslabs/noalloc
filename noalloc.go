@@ -275,7 +275,7 @@ func Check(cfg Config) (*Result, error) {
 		exempt: map[string]map[int]bool{}, lines: map[string][]string{}, appends: map[*ssa.Function]bool{},
 		fixed: map[types.Type]bool{}, marks: map[*ast.Comment]bool{}, lineState: map[string]map[int]uint8{},
 		moduleFiles: map[string]bool{}, inlinedBodies: map[*ssa.Function]bool{}}
-	c.impls = map[string][]*ssa.Function{}
+	c.impls, c.open = map[string][]*ssa.Function{}, map[ssa.CallInstruction]bool{}
 	c.files, c.fileInfo = map[string]*ast.File{}, map[string]*types.Info{}
 	for _, p := range pkgs {
 		for _, f := range p.Syntax {
@@ -533,9 +533,12 @@ type checker struct {
 	cg    *callgraph.Graph
 	cha   *callgraph.Graph
 	// modulePkgs are the module's packages, by path, and impls the methods
-	// implementers found for each interface method.
+	// implementers found for each interface method. open holds the interface
+	// method calls VTA resolves to nothing, which any implementation can
+	// answer.
 	modulePkgs []*types.Package
 	impls      map[string][]*ssa.Function
+	open       map[ssa.CallInstruction]bool
 	// files holds the module's syntax by absolute path, and fileInfo the type
 	// information each file was checked with.
 	files    map[string]*ast.File
@@ -1879,6 +1882,7 @@ func (c *checker) edges(fn *ssa.Function) []*callgraph.Edge {
 			}
 			var callees []*ssa.Function
 			if site.Common().IsInvoke() {
+				c.open[site] = true
 				callees = c.implementers(site.Common())
 			} else if callee := site.Common().StaticCallee(); callee != nil {
 				callees = []*ssa.Function{callee}
@@ -2717,23 +2721,27 @@ func (c *checker) callAllocs(call ssa.CallInstruction) []string {
 		return nil
 	}
 	callees := c.expand(c.sites[call], map[*ssa.Function]bool{})
-	if len(callees) == 0 {
+	var out []string
+	if c.open[call] {
+		// The module's implementations are checked where they are defined.
+		// Those outside it are judged by their code, with no failure of
+		// theirs taken to end the call.
 		desc := callDesc(cm)
-		if s, ok := c.methodSummary(cm); ok {
-			// Every implementation is outside the module, and judged by
-			// its code, with no failure of theirs taken to end the call.
-			if !s.Alloc[0] || c.overridden(desc) {
-				return nil
+		if s, ok := c.methodSummary(cm); ok && !s.NoImpl {
+			if s.Alloc[0] && !c.overridden(desc) {
+				c.noteWhy(call, s.Why[0])
+				out = append(out, "calls "+desc)
 			}
-			c.noteWhy(call, s.Why[0])
-			return []string{"calls " + desc}
+		} else if len(callees) == 0 && !c.overridden(desc) {
+			return []string{"call with no known callee: " + desc}
 		}
+	} else if len(callees) == 0 {
+		desc := callDesc(cm)
 		if c.overridden(desc) {
 			return nil
 		}
 		return []string{"call with no known callee: " + desc}
 	}
-	var out []string
 	for _, callee := range callees {
 		if c.appendRoot(callee) {
 			if dst := appendedTo(cm, callee); dst == nil || !c.reused(dst) {

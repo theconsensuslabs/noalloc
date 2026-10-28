@@ -588,7 +588,7 @@ func TestFormatAllocatesNothing(t *testing.T) {
 ### Calls it cannot resolve
 
 When noalloc can't tell which function a function value refers to, it reports
-the call. For an interface call, it checks every method the call could reach:
+the call. [Interface calls](#interface-calls) have a section of their own.
 
 ```go
 //noalloc:root
@@ -603,6 +603,75 @@ run.go:5: example.com/app.Run: call with no known callee: f
 ```
 
 To fix this, call a concrete function or type instead, or exempt the call.
+
+### Interface calls
+
+noalloc checks every method an interface call can reach.
+
+If your module shows the value's concrete type, only that type's method is
+checked. noalloc finds this with VTA (variable type analysis), which follows
+what gets assigned to locals and fields.
+
+```go
+//noalloc:root
+func Area(n int) int {
+	var s Shape = Square{n}
+	return s.Area() // Only Square.Area is checked.
+}
+```
+
+Otherwise, as with a root's parameter, every implementation noalloc can find
+is checked. Your module's are checked where they're defined. Those outside
+your module are checked by their code, and the call is reported if any of
+them allocates.
+
+```go
+//noalloc:root
+func Send(w io.Writer, p []byte) (int, error) {
+	return w.Write(p)
+}
+```
+
+```
+$ noalloc
+send.go:5: example.com/app.Send: calls io.Writer.Write
+```
+
+Here `(*bytes.Buffer).Write` can grow its buffer. A call to `Err` on a
+`context.Context` passes, since no implementation of it in the standard
+library allocates.
+
+A method nothing implements is reported as a `call with no known callee`. A
+method call on a type parameter is checked against the parameter's
+constraint.
+
+noalloc allows:
+
+- Type assertions and type switches.
+- Converting a value to an interface, if the value stays on the stack or is
+  zero-size, a single byte, or a bool.
+- Passing your own type to code outside your module as an interface.
+  `sort.Sort(byLen(xs))` checks `byLen`'s `Len`, `Less`, and `Swap`.
+
+Limits:
+
+- Only packages your module imports are searched for implementations. A
+  caller outside your module can pass one from somewhere else, and adding an
+  import anywhere in your module can change what a call is checked against.
+- Every type in your module that implements the interface is checked, even
+  one no caller passes.
+- An unnamed interface, such as `interface{ Do() int }`, and `error` have no
+  implementations noalloc can look up outside your module. Calls to them are
+  reported, as in `calls error.Error`.
+- A call through a method value, as in `f := s.Area` then `f()`, is reported
+  as a `call with no known callee`.
+
+To allow a reported interface call, exempt the line or add the call to an
+allowlist file passed with `-allow`:
+
+```
+measured: io.Writer.Write
+```
 
 ### Code no root reaches
 
