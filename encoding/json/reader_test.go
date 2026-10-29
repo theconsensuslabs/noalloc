@@ -201,8 +201,9 @@ func FuzzNumbersMatchUnmarshal(f *testing.F) {
 }
 
 // strictTime is the form of RFC 3339 that time.Time's UnmarshalJSON parses
-// before falling back on time.Parse, and the only one the Reader decodes.
-var strictTime = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$`)
+// before falling back on time.Parse, and the only one the Reader decodes. The
+// offset is held to RFC 3339's range because time.Parse accepts up to +24:60.
+var strictTime = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$`)
 
 // FuzzTimeMatchesUnmarshal reads a string as a time and compares it with
 // json.Unmarshal into a time.Time: the same instant, in UTC, for every time in
@@ -211,7 +212,8 @@ func FuzzTimeMatchesUnmarshal(f *testing.F) {
 	for _, s := range []string{"2026-10-27T12:34:56Z", "2026-10-27T12:34:56.123456789Z", "2026-10-27T12:34:56.1Z",
 		"2024-02-29T00:00:00Z", "2023-02-29T00:00:00Z", "0000-01-01T00:00:00Z", "9999-12-31T23:59:59.999999999Z",
 		"2026-10-27T24:00:00Z", "2026-10-27T12:34:60Z", "2026-10-27t12:34:56z", "2026-10-27T12:34:56,5Z",
-		"2026-10-27T12:34:56.Z", "2026-10-27T12:34:56.1234567890Z", "2026-10-27T12:34:56+00:00", "2026-1-27T12:34:56Z"} {
+		"2026-10-27T12:34:56.Z", "2026-10-27T12:34:56.1234567890Z", "2026-10-27T12:34:56+00:00", "2026-1-27T12:34:56Z",
+		"2026-10-27T12:34:56+00:60", "2026-10-27T12:34:56-24:60", "2026-10-27T12:34:56+25:00", "2026-10-27T12:34:56+00:61"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
