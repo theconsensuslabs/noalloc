@@ -309,8 +309,10 @@ var explainedBy = []struct {
 	reasons []string
 }{
 	{regexp.MustCompile(`^(mapassign.*|makemap.*)$`), []string{"map write", "make with a size"}},
-	{regexp.MustCompile(`^(concatstring.*|concatbyte.*|slicebytetostring|stringtoslicebyte|stringtoslicerune|slicerunetostring|intstring|rawstring.*)$`),
-		[]string{"string concatenation", "conversion"}},
+	{
+		regexp.MustCompile(`^(concatstring.*|concatbyte.*|slicebytetostring|stringtoslicebyte|stringtoslicerune|slicerunetostring|intstring|rawstring.*)$`),
+		[]string{"string concatenation", "conversion"},
+	},
 	{regexp.MustCompile(`^(growslice|makeslice.*)$`), []string{"append", "make with a size"}},
 	{regexp.MustCompile(`^(makechan.*)$`), []string{"make chan"}},
 	{regexp.MustCompile(`^(newproc)$`), []string{"go statement"}},

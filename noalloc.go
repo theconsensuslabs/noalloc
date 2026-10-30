@@ -271,10 +271,12 @@ func Check(cfg Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &checker{cfg: cfg, prog: prog, fset: prog.Fset, allow: allow,
+	c := &checker{
+		cfg: cfg, prog: prog, fset: prog.Fset, allow: allow,
 		exempt: map[string]map[int]bool{}, lines: map[string][]string{}, appends: map[*ssa.Function]bool{},
 		fixed: map[types.Type]bool{}, marks: map[*ast.Comment]bool{}, lineState: map[string]map[int]uint8{},
-		moduleFiles: map[string]bool{}, inlinedBodies: map[*ssa.Function]bool{}}
+		moduleFiles: map[string]bool{}, inlinedBodies: map[*ssa.Function]bool{},
+	}
 	c.impls, c.open = map[string][]*ssa.Function{}, map[ssa.CallInstruction]bool{}
 	c.files, c.fileInfo = map[string]*ast.File{}, map[string]*types.Info{}
 	for _, p := range pkgs {
@@ -343,8 +345,10 @@ func Check(cfg Config) (*Result, error) {
 		}
 		f := found[file][pos.Line]
 		if f == nil {
-			f = &Finding{File: file, Line: pos.Line, Source: c.lineTokens(pos.Filename, pos.Line), Func: c.stableName(fn),
-				Group: c.group[fn], Path: c.path(fn)}
+			f = &Finding{
+				File: file, Line: pos.Line, Source: c.lineTokens(pos.Filename, pos.Line), Func: c.stableName(fn),
+				Group: c.group[fn], Path: c.path(fn),
+			}
 			found[file][pos.Line] = f
 		}
 		if !sites[at] {
@@ -799,8 +803,10 @@ func (c *checker) scanFile(p *packages.Package, f *ast.File) []*ssa.Function {
 			}
 			c.exemptionAt[pos.Filename][line] = len(c.exemptions)
 			inSource := p.PkgPath != c.cfg.Module && !strings.HasPrefix(p.PkgPath, c.cfg.Module+"/")
-			c.exemptions = append(c.exemptions, Exemption{File: c.rel(pos.Filename), Line: line,
-				Func: enclosingFunc(p, f, cm.Pos()), Reason: strings.TrimSpace(reason), InSource: inSource})
+			c.exemptions = append(c.exemptions, Exemption{
+				File: c.rel(pos.Filename), Line: line,
+				Func: enclosingFunc(p, f, cm.Pos()), Reason: strings.TrimSpace(reason), InSource: inSource,
+			})
 		}
 	}
 	return roots
@@ -1916,14 +1922,28 @@ func (c *checker) implementers(cm *ssa.CallCommon) []*ssa.Function {
 				continue
 			}
 			named, ok := tn.Type().(*types.Named)
-			if !ok || named.TypeParams().Len() > 0 || types.IsInterface(named) {
+			if !ok || types.IsInterface(named) {
 				continue
 			}
-			for _, t := range []types.Type{named, types.NewPointer(named)} {
-				if !types.Implements(t, iface) {
+			for meth := range named.Methods() {
+				if meth.Name() != cm.Method.Name() {
 					continue
 				}
-				if fn := c.prog.LookupMethod(t, cm.Method.Pkg(), cm.Method.Name()); fn != nil {
+
+				// Concrete types and methods.
+				if named.TypeParams().Len() == 0 && meth.Signature().TypeParams().Len() == 0 {
+					for _, t := range []types.Type{named, types.NewPointer(named)} {
+						if types.Implements(t, iface) {
+							if fn := c.prog.LookupMethod(t, cm.Method.Pkg(), cm.Method.Name()); fn != nil {
+								fns = append(fns, fn)
+								break
+							}
+						}
+					}
+					continue
+				}
+				// Generic type or method.
+				if fn := c.prog.FuncValue(meth); fn != nil {
 					fns = append(fns, fn)
 					break
 				}
