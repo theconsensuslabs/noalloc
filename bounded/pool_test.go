@@ -8,10 +8,10 @@ import (
 	"slices"
 	"sync"
 	"testing"
-
-	"github.com/theconsensuslabs/noalloc/alloctest"
 	"time"
 	"unsafe"
+
+	"github.com/theconsensuslabs/noalloc/alloctest"
 )
 
 // A Region borrows up to its budget, a Pool lends no more chunks than it
@@ -21,20 +21,20 @@ func TestARegionBorrowsUpToItsBudget(t *testing.T) {
 	p := NewPool[*int](16, 3)
 	var r Region
 	r.Reset(2 * p.ChunkBytes())
-	a, b := Take(&r, p), Take(&r, p)
+	a, b := r.Take(p), r.Take(p)
 	if a == nil || b == nil || len(a) != 16 {
 		t.Fatalf("two chunks within the budget: %v, %v", a, b)
 	}
-	if c := Take(&r, p); c != nil || r.Held() != 2*p.ChunkBytes() {
+	if c := r.Take(p); c != nil || r.Held() != 2*p.ChunkBytes() {
 		t.Errorf("a chunk past the budget was lent, or the region holds %d", r.Held())
 	}
 	a[0] = new(int)
 	var other Region
 	other.Reset(4 * p.ChunkBytes())
-	if c := Take(&other, p); c == nil || p.Free() != 0 {
+	if c := other.Take(p); c == nil || p.Free() != 0 {
 		t.Fatalf("the last chunk: %v, %d free", c, p.Free())
 	}
-	if c := Take(&other, p); c != nil {
+	if c := other.Take(p); c != nil {
 		t.Error("an empty pool lent a chunk")
 	}
 	r.Release()
@@ -77,14 +77,20 @@ func TestHasPointers(t *testing.T) {
 		t    reflect.Type
 		want bool
 	}{
-		{reflect.TypeFor[byte](), false}, {reflect.TypeFor[[4]uint32](), false},
-		{reflect.TypeFor[struct{ a, b int }](), false}, {reflect.TypeFor[[0]*int](), false},
-		{reflect.TypeFor[string](), true}, {reflect.TypeFor[[]byte](), true}, {reflect.TypeFor[*int](), true},
-		{reflect.TypeFor[any](), true}, {reflect.TypeFor[struct {
+		{reflect.TypeFor[byte](), false},
+		{reflect.TypeFor[[4]uint32](), false},
+		{reflect.TypeFor[struct{ a, b int }](), false},
+		{reflect.TypeFor[[0]*int](), false},
+		{reflect.TypeFor[string](), true},
+		{reflect.TypeFor[[]byte](), true},
+		{reflect.TypeFor[*int](), true},
+		{reflect.TypeFor[any](), true},
+		{reflect.TypeFor[struct {
 			a int
 			b map[int]int
 		}](), true},
-		{reflect.TypeFor[[2]struct{ f func() }](), true}, {reflect.TypeFor[slot[uint32, struct{}]](), false},
+		{reflect.TypeFor[[2]struct{ f func() }](), true},
+		{reflect.TypeFor[slot[uint32, struct{}]](), false},
 	} {
 		if got := hasPointers(c.t); got != c.want {
 			t.Errorf("hasPointers(%v) = %v, want %v", c.t, got, c.want)
@@ -99,10 +105,10 @@ func TestWaitTakesAChunkWhenOneComesFree(t *testing.T) {
 	var holder, waiter Region
 	holder.Reset(64)
 	waiter.Reset(64)
-	Take(&holder, p)
+	holder.Take(p)
 	got := make(chan bool)
 	go func() {
-		_, ok := Wait(nil, &waiter, p)
+		_, ok := waiter.Wait(nil, p)
 		got <- ok
 	}()
 	holder.Release()
@@ -111,12 +117,12 @@ func TestWaitTakesAChunkWhenOneComesFree(t *testing.T) {
 	}
 	done := make(chan struct{})
 	close(done)
-	if _, ok := Wait(done, &holder, p); ok {
+	if _, ok := holder.Wait(done, p); ok {
 		t.Error("Wait took a chunk from an empty pool after done closed")
 	}
 	var small Region
 	small.Reset(8)
-	if _, ok := Wait(nil, &small, p); ok {
+	if _, ok := small.Wait(nil, p); ok {
 		t.Error("Wait took a chunk past the region's budget")
 	}
 }
@@ -130,7 +136,7 @@ func TestRegionsShareAPoolSafely(t *testing.T) {
 			var r Region
 			for i := range 200 {
 				r.Reset(64)
-				if c, ok := Wait(nil, &r, p); ok {
+				if c, ok := r.Wait(nil, p); ok {
 					for j := range c {
 						c[j] = g*1000 + i
 					}
@@ -280,7 +286,7 @@ func TestABufMovesOnceToABorrowedChunk(t *testing.T) {
 
 	var w bytes.Buffer
 	r.Reset(1 << 20)
-	held := Take(&r, p)
+	held := r.Take(p)
 	var f Buf
 	f.Reset(make([]byte, 4), &w)
 	f.Borrow(&r, NewClasses(p))
@@ -299,14 +305,14 @@ func TestAPoolCountsWhatItLent(t *testing.T) {
 	var a, b Region
 	a.Reset(64)
 	b.Reset(64)
-	Take(&a, p)
-	Take(&b, p)
+	a.Take(p)
+	b.Take(p)
 	testHookWaiting = a.Release
-	Wait(nil, &b, p)
+	b.Wait(nil, p)
 	testHookWaiting = nil
 	var small Region
 	small.Reset(4)
-	Take(&small, p)
+	small.Take(p)
 	st := p.Stats()
 	if st.Lent != 2 || st.Empty != 2 || st.Waited < 0 || st.OverBudget != 1 {
 		t.Errorf("stats %+v, want 2 lent, 2 empty, no negative wait, 1 over budget", st)
@@ -322,7 +328,7 @@ func BenchmarkBorrow(b *testing.B) {
 		var r Region
 		for b.Loop() {
 			r.Reset(16 << 10)
-			Take(&r, p)
+			r.Take(p)
 			r.Release()
 		}
 	})
@@ -331,7 +337,7 @@ func BenchmarkBorrow(b *testing.B) {
 			var r Region
 			for pb.Next() {
 				r.Reset(16 << 10)
-				Take(&r, p)
+				r.Take(p)
 				r.Release()
 			}
 		})
@@ -394,13 +400,13 @@ func TestAnUncontendedBorrowTouchesOneShardAndNoSharedMemory(t *testing.T) {
 	p := NewPool[byte](64, 64)
 	var r Region
 	r.Reset(1 << 20)
-	Take(&r, p) // the home shard's chunk, given back below, starts the loop there
+	r.Take(p) // the home shard's chunk, given back below, starts the loop there
 	r.Release()
 	before, shared := visits(p), poolBytes(p, r.home())
 	const n = 1000
 	for i := range n {
 		r.Reset(1 << 20)
-		if Take(&r, p) == nil {
+		if r.Take(p) == nil {
 			t.Fatal("a pool with free chunks lent none")
 		}
 		if i == 0 && !bytes.Equal(poolBytes(p, r.home()), shared) {
@@ -442,31 +448,31 @@ func TestReserveBorrowsAllOrNone(t *testing.T) {
 	p := NewPool[byte](8, 3)
 	var r Region
 	r.Reset(1 << 20)
-	if !Reserve(nil, &r, p, 2) || p.Free() != 1 || r.Held() != 16 {
+	if !r.Reserve(nil, p, 2) || p.Free() != 1 || r.Held() != 16 {
 		t.Fatalf("a reservation of 2: %d free, %d held", p.Free(), r.Held())
 	}
-	a, b := Take(&r, p), Take(&r, p)
+	a, b := r.Take(p), r.Take(p)
 	if a == nil || b == nil || p.Free() != 1 || p.Stats().Lent != 2 {
 		t.Errorf("Takes of a reservation borrowed past it: %d free, %+v", p.Free(), p.Stats())
 	}
-	if c := Take(&r, p); c == nil || p.Free() != 0 {
+	if c := r.Take(p); c == nil || p.Free() != 0 {
 		t.Error("a Take past the reservation borrowed nothing")
 	}
 	r.Release()
 
 	var holder Region
 	holder.Reset(1 << 20)
-	Take(&holder, p)
-	Take(&holder, p)
+	holder.Take(p)
+	holder.Take(p)
 	done := make(chan struct{})
 	close(done)
 	r.Reset(1 << 20)
-	if Reserve(done, &r, p, 2) || r.Held() != 0 || p.Free() != 1 {
+	if r.Reserve(done, p, 2) || r.Held() != 0 || p.Free() != 1 {
 		t.Errorf("a reservation that could not be met: held %d, %d free", r.Held(), p.Free())
 	}
 	var small Region
 	small.Reset(8)
-	if Reserve(nil, &small, p, 2) || p.Free() != 1 {
+	if small.Reserve(nil, p, 2) || p.Free() != 1 {
 		t.Error("a reservation past the budget borrowed")
 	}
 	holder.Release()
@@ -482,11 +488,11 @@ func TestReserveWaitsForChunksGivenBack(t *testing.T) {
 	var holder, r Region
 	holder.Reset(1 << 20)
 	r.Reset(1 << 20)
-	Take(&holder, p)
+	holder.Take(p)
 	waited := false
 	testHookWaiting = func() { waited = true; holder.Release() }
 	defer func() { testHookWaiting = nil }()
-	if !Reserve(nil, &r, p, 2) || r.Held() != 16 || !waited {
+	if !r.Reserve(nil, p, 2) || r.Held() != 16 || !waited {
 		t.Errorf("the reservation was not met once a chunk came back: held %d", r.Held())
 	}
 	r.Release()
@@ -508,7 +514,7 @@ func BenchmarkBorrowAgainstSyncPool(b *testing.B) {
 		var r Region
 		for b.Loop() {
 			r.Reset(16 << 10)
-			Take(&r, p)[0] = 1
+			r.Take(p)[0] = 1
 			r.Release()
 		}
 	})
@@ -526,7 +532,7 @@ func BenchmarkBorrowAgainstSyncPool(b *testing.B) {
 			r := new(Region)
 			for pb.Next() {
 				r.Reset(16 << 10)
-				Take(r, p)[0] = 1
+				r.Take(p)[0] = 1
 				r.Release()
 			}
 		})
@@ -540,7 +546,7 @@ func TestEachGiveBackReachesEachWaiter(t *testing.T) {
 		"Release": func(t *testing.T, p *Pool[byte]) func() {
 			var r Region
 			r.Reset(p.ChunkBytes())
-			if Take(&r, p) == nil {
+			if r.Take(p) == nil {
 				t.Fatal("the pool's one chunk was not lent")
 			}
 			return r.Release
@@ -548,11 +554,11 @@ func TestEachGiveBackReachesEachWaiter(t *testing.T) {
 		"GiveBack": func(t *testing.T, p *Pool[byte]) func() {
 			var r Region
 			r.Reset(p.ChunkBytes())
-			chunk := Take(&r, p)
+			chunk := r.Take(p)
 			if chunk == nil {
 				t.Fatal("the pool's one chunk was not lent")
 			}
-			return func() { GiveBack(&r, p, chunk) }
+			return func() { r.GiveBack(p, chunk) }
 		},
 		"a Slice moving up a class": func(t *testing.T, p *Pool[byte]) func() {
 			var r Region
@@ -567,10 +573,10 @@ func TestEachGiveBackReachesEachWaiter(t *testing.T) {
 	}
 	waiters := map[string]func(r *Region, p *Pool[byte]) bool{
 		"Wait": func(r *Region, p *Pool[byte]) bool {
-			_, ok := Wait(nil, r, p)
+			_, ok := r.Wait(nil, p)
 			return ok
 		},
-		"Reserve": func(r *Region, p *Pool[byte]) bool { return Reserve(nil, r, p, 1) },
+		"Reserve": func(r *Region, p *Pool[byte]) bool { return r.Reserve(nil, p, 1) },
 	}
 	for gn, giver := range givers {
 		for wn, wait := range waiters {
@@ -631,24 +637,24 @@ func TestEveryChunkIsFreeOrHeldOnce(t *testing.T) {
 	var taken [3][][]byte
 	ops := []func(i int, rng *rand.Rand){
 		func(i int, _ *rand.Rand) {
-			if c := Take(&regions[i], small); c != nil {
+			if c := regions[i].Take(small); c != nil {
 				taken[i] = append(taken[i], c)
 			}
 		},
 		func(i int, _ *rand.Rand) {
-			if c, ok := Wait(closed, &regions[i], large); ok {
+			if c, ok := regions[i].Wait(closed, large); ok {
 				taken[i] = append(taken[i], c)
 			}
 		},
-		func(i int, rng *rand.Rand) { Reserve(closed, &regions[i], small, 1+rng.IntN(3)) },
+		func(i int, rng *rand.Rand) { regions[i].Reserve(closed, small, 1+rng.IntN(3)) },
 		func(i int, _ *rand.Rand) {
 			if n := len(taken[i]); n > 0 {
 				c := taken[i][n-1]
 				taken[i] = taken[i][:n-1]
 				if len(c) == small.ChunkLen() {
-					GiveBack(&regions[i], small, c)
+					regions[i].GiveBack(small, c)
 				} else {
-					GiveBack(&regions[i], large, c)
+					regions[i].GiveBack(large, c)
 				}
 			}
 		},

@@ -34,8 +34,10 @@ func NewPool[T any](chunkLen, count int) *Pool[T] {
 	//noalloc:exempt setup: a pool's chunks, set aside once.
 	mem := make([]T, chunkLen*count)
 	//noalloc:exempt setup: a pool's list of its chunks, set aside once.
-	p := &Pool[T]{chunks: make([][]T, count), bytes: chunkLen * int(unsafe.Sizeof(zero)),
-		pointers: hasPointers(reflect.TypeFor[T]())}
+	p := &Pool[T]{
+		chunks: make([][]T, count), bytes: chunkLen * int(unsafe.Sizeof(zero)),
+		pointers: hasPointers(reflect.TypeFor[T]()),
+	}
 	for i := range count {
 		p.chunks[i] = mem[i*chunkLen : (i+1)*chunkLen : (i+1)*chunkLen]
 	}
@@ -208,7 +210,7 @@ func (r *Region) spare(p lender) (int32, bool) {
 // must not be used after.
 //
 //noalloc:root
-func GiveBack[T any](r *Region, p *Pool[T], chunk []T) {
+func (r *Region) GiveBack[T any](p *Pool[T], chunk []T) {
 	i := p.index(chunk)
 	for k := range r.loans[:r.n] {
 		if l := &r.loans[k]; l.from == lender(p) && l.i == i && !l.spare {
@@ -245,7 +247,7 @@ func (p *Pool[T]) index(chunk []T) int32 {
 // how many pages run at once, and size p to hold each one's reservation.
 //
 //noalloc:root
-func Reserve[T any](done <-chan struct{}, r *Region, p *Pool[T], n int) bool {
+func (r *Region) Reserve[T any](done <-chan struct{}, p *Pool[T], n int) bool {
 	if r.n+n > regionLoans || r.held+n*p.bytes > r.budget {
 		p.free.overBudget.Add(1)
 		return false
@@ -273,7 +275,7 @@ func Reserve[T any](done <-chan struct{}, r *Region, p *Pool[T], n int) bool {
 // other holds what its last borrower left.
 //
 //noalloc:root
-func Take[T any](r *Region, p *Pool[T]) []T {
+func (r *Region) Take[T any](p *Pool[T]) []T {
 	if i, ok := r.spare(p); ok {
 		return p.chunks[i]
 	}
@@ -294,7 +296,7 @@ func Take[T any](r *Region, p *Pool[T]) []T {
 // and when done closes first.
 //
 //noalloc:root
-func Wait[T any](done <-chan struct{}, r *Region, p *Pool[T]) ([]T, bool) {
+func (r *Region) Wait[T any](done <-chan struct{}, p *Pool[T]) ([]T, bool) {
 	if i, ok := r.spare(p); ok {
 		return p.chunks[i], true
 	}

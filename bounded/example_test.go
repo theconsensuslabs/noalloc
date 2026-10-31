@@ -117,9 +117,9 @@ func ExamplePool() {
 	a.Reset(4 << 10)
 	b.Reset(4 << 10)
 
-	fmt.Println(bounded.Take(&a, pool) != nil, bounded.Take(&a, pool) != nil, bounded.Take(&b, pool) == nil)
+	fmt.Println(a.Take(pool) != nil, a.Take(pool) != nil, b.Take(pool) == nil)
 	a.Release()
-	fmt.Println(bounded.Take(&b, pool) != nil, pool.Free())
+	fmt.Println(b.Take(pool) != nil, pool.Free())
 	b.Release()
 
 	st := pool.Stats()

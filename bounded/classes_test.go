@@ -75,8 +75,8 @@ func TestGiveBackReturnsOneChunk(t *testing.T) {
 	p := NewPool[byte](16, 2)
 	var r Region
 	r.Reset(1 << 20)
-	a, b := Take(&r, p), Take(&r, p)
-	GiveBack(&r, p, a)
+	a, b := r.Take(p), r.Take(p)
+	r.GiveBack(p, a)
 	if p.Free() != 1 || r.Held() != 16 {
 		t.Errorf("after one chunk given back: %d free, %d held", p.Free(), r.Held())
 	}
@@ -87,7 +87,7 @@ func TestGiveBackReturnsOneChunk(t *testing.T) {
 					t.Errorf("GiveBack took a chunk the region does not hold")
 				}
 			}()
-			GiveBack(&r, p, bad)
+			r.GiveBack(p, bad)
 		}()
 	}
 	r.Release()
@@ -128,7 +128,7 @@ func TestASliceMovesUpThroughItsClasses(t *testing.T) {
 	r.Release()
 
 	r.Reset(1 << 20)
-	held := Take(&r, mid)
+	held := r.Take(mid)
 	s.ResetFrom(&r, c)
 	if !s.Extend(make([]int, 10)) || s.Cap() != 64 {
 		t.Errorf("with the middle class lent, 10 items went to a chunk of %d", s.Cap())

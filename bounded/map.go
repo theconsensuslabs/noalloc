@@ -90,7 +90,7 @@ func (m *Map[K, V]) grow() bool {
 		}
 	}
 	if oldP != nil {
-		GiveBack(m.r, oldP, old)
+		m.r.GiveBack(oldP, old)
 	}
 	return true
 }
@@ -116,7 +116,7 @@ func slotsFor(n int) int {
 //
 //noalloc:root
 func (m *Map[K, V]) ResetFrom(r *Region, p *MapPool[K, V]) bool {
-	slots := Take(r, p)
+	slots := r.Take(p)
 	clear(slots)
 	*m = Map[K, V]{slots: slots, seed: maphash.MakeSeed(), limit: len(slots) / 2, gen: 1}
 	if slots != nil {
