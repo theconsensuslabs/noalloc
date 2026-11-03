@@ -635,8 +635,11 @@ type checker struct {
 	// that every caller reach came to it from stops on.
 	stops map[*ssa.Function]map[signal]bool
 
-	nonNil  memo[*ssa.Function]
-	fromScr memo[ssa.Value]
+	nonNil memo[*ssa.Function]
+	wraps  memo[ssa.Value]
+	// calleesAt holds what siteCallees reads from VTA's graph.
+	calleesAt map[ssa.CallInstruction][]*ssa.Function
+	fromScr   memo[ssa.Value]
 	// denied holds the variables grounded is asking about, and groundedAt
 	// its answers.
 	fromPtr    memo[ssa.Value]
@@ -670,16 +673,21 @@ func (c *checker) ours(fn *ssa.Function) bool {
 	if fn.Pkg == nil {
 		return false
 	}
+	return c.ownPackage(fn.Pkg.Pkg.Path())
+}
+
+// ownPackage reports whether path is checked as a package of the module.
+func (c *checker) ownPackage(path string) bool {
 	if c.world != nil {
-		return c.world(fn.Pkg.Pkg.Path())
+		return c.world(path)
 	}
 	// sync is checked as outside code even from source: a sync.Once's
 	// function is setup that runs once, and a lock is no call into what it
 	// guards.
-	if fn.Pkg.Pkg.Path() == "sync" {
+	if path == "sync" {
 		return false
 	}
-	return c.inModule(fn.Pkg.Pkg.Path())
+	return c.inModule(path)
 }
 
 // wrapper reports whether fn is a function SSA made up, such as a bound
@@ -1584,7 +1592,7 @@ func (c *checker) pathsFrom(b *ssa.BasicBlock, start *facts, ok map[*ssa.BasicBl
 		case *ssa.Return:
 			return ret(last, f)
 		case *ssa.If:
-			if arm, decided := errArm(last, f.is); decided {
+			if arm, decided := c.errArm(last, f.is); decided {
 				succs = succs[arm : arm+1]
 			} else if v, known := f.value(last.Cond); known {
 				if v {
@@ -1695,39 +1703,233 @@ const failurePathSteps = 4096
 
 // errArm is the successor an If takes when the error it tests, one of is,
 // is neither nil nor a package-level sentinel, when the If decides it.
-func errArm(br *ssa.If, is map[ssa.Value]bool) (int, bool) {
-	cmp, isCmp := br.Cond.(*ssa.BinOp)
-	if !isCmp || cmp.Op != token.EQL && cmp.Op != token.NEQ {
+func (c *checker) errArm(br *ssa.If, is map[ssa.Value]bool) (int, bool) {
+	v, decided := c.errTest(br.Cond, is)
+	if !decided {
 		return 0, false
 	}
-	other := cmp.Y
-	if !is[cmp.X] {
-		if !is[cmp.Y] {
-			return 0, false
-		}
-		other = cmp.X
-	}
-	switch o := other.(type) {
-	case *ssa.Const:
-		if !o.IsNil() {
-			return 0, false
-		}
-	case *ssa.UnOp:
-		if _, isGlobal := o.X.(*ssa.Global); !isGlobal || o.Op != token.MUL {
-			return 0, false
-		}
-	case *ssa.MakeInterface:
-		// A constant error, which nothing allocates.
-		if _, isConst := o.X.(*ssa.Const); !isConst {
-			return 0, false
-		}
-	default:
-		return 0, false
-	}
-	if cmp.Op == token.NEQ {
+	if v {
 		return 0, true
 	}
 	return 1, true
+}
+
+// errTest is the value cond has when the error it tests, one of is, is
+// neither nil nor a package-level sentinel, when cond decides it: a
+// comparison with nil or a sentinel, or errors.Is of an error that cannot wrap
+// the sentinel it is given.
+func (c *checker) errTest(cond ssa.Value, is map[ssa.Value]bool) (bool, bool) {
+	switch cond := cond.(type) {
+	case *ssa.UnOp:
+		if cond.Op == token.NOT {
+			v, decided := c.errTest(cond.X, is)
+			return !v, decided
+		}
+	case *ssa.BinOp:
+		if cond.Op != token.EQL && cond.Op != token.NEQ {
+			return false, false
+		}
+		other := cond.Y
+		if !is[cond.X] {
+			if !is[cond.Y] {
+				return false, false
+			}
+			other = cond.X
+		}
+		return cond.Op == token.NEQ, isSentinel(other)
+	case *ssa.Call:
+		callee := cond.Call.StaticCallee()
+		if callee == nil || callee.String() != "errors.Is" {
+			return false, false
+		}
+		err, target := cond.Call.Args[0], cond.Call.Args[1]
+		return false, is[err] && c.ownSentinel(target) && !c.mayWrap(err)
+	}
+	return false, false
+}
+
+// isSentinel reports whether v, an error, is nil, a package-level variable,
+// or a constant one, which nothing allocates.
+func isSentinel(v ssa.Value) bool {
+	switch v := v.(type) {
+	case *ssa.Const:
+		return v.IsNil()
+	case *ssa.UnOp:
+		_, isGlobal := v.X.(*ssa.Global)
+		return isGlobal && v.Op == token.MUL
+	case *ssa.MakeInterface:
+		_, isConst := v.X.(*ssa.Const)
+		return isConst
+	}
+	return false
+}
+
+// ownSentinel reports whether v, an error, is a package-level variable or a
+// constant of a package of the module, which code outside the module does not
+// wrap.
+func (c *checker) ownSentinel(v ssa.Value) bool {
+	if !isSentinel(v) {
+		return false
+	}
+	switch v := v.(type) {
+	case *ssa.UnOp:
+		return c.ownPackage(v.X.(*ssa.Global).Pkg.Pkg.Path())
+	case *ssa.MakeInterface:
+		named, isNamed := types.Unalias(v.X.Type()).(*types.Named)
+		return isNamed && named.Obj().Pkg() != nil && c.ownPackage(named.Obj().Pkg().Path())
+	}
+	return false
+}
+
+// mayWrap reports whether a failure v holds can wrap a sentinel of the module.
+// It cannot when v is a sentinel, a boxed value of a type errors.Is does not
+// look inside, or the result of a call that reaches no code that wraps and is
+// passed no error that may wrap. Any other value may.
+func (c *checker) mayWrap(v ssa.Value) bool {
+	return c.wraps.get(v, false, func() bool {
+		if isSentinel(v) {
+			return false
+		}
+		switch v := v.(type) {
+		case *ssa.MakeInterface:
+			return c.wrappingType(v.X.Type())
+		case *ssa.Phi:
+			return slices.ContainsFunc(v.Edges, c.mayWrap)
+		case *ssa.Call:
+			return c.callMayWrap(v)
+		case *ssa.Extract:
+			call, isCall := v.Tuple.(*ssa.Call)
+			return !isCall || c.callMayWrap(call)
+		}
+		return true
+	})
+}
+
+func (c *checker) callMayWrap(call *ssa.Call) bool {
+	return slices.ContainsFunc(call.Call.Args, func(a ssa.Value) bool {
+		return types.Identical(a.Type(), errorType) && c.mayWrap(a)
+	}) || c.reachesWrap(call)
+}
+
+// wrappingType reports whether errors.Is looks inside an error of type t.
+func (c *checker) wrappingType(t types.Type) bool {
+	ms := c.prog.MethodSets.MethodSet(t)
+	return ms.Lookup(nil, "Is") != nil || ms.Lookup(nil, "Unwrap") != nil
+}
+
+// wrapVerb matches a %w in a format string.
+var wrapVerb = regexp.MustCompile(`%[^a-zA-Z%]*w`)
+
+// reachesWrap reports whether a module function that call can run, in any of
+// its blocks, can wrap an error: by a fmt.Errorf format that has a %w or is
+// not a constant, by errors.Join, by boxing a type wrappingType reports, or by
+// a call outside the module that passesError reports. It follows the module
+// functions handed to code outside the module, and takes that code to wrap
+// no other error.
+func (c *checker) reachesWrap(call ssa.CallInstruction) bool {
+	seen := map[*ssa.Function]bool{}
+	var stack []*ssa.Function
+	wraps := func(site ssa.CallInstruction) bool {
+		callees := c.siteCallees(site)
+		for _, callee := range callees {
+			switch callee.String() {
+			case "errors.Join":
+				return true
+			case "errors.Unwrap":
+				continue
+			case "fmt.Errorf":
+				if site.Common().StaticCallee() != callee {
+					return true
+				}
+				format, isConst := site.Common().Args[0].(*ssa.Const)
+				if !isConst || wrapVerb.MatchString(constant.StringVal(format.Value)) {
+					return true
+				}
+			}
+			if c.ours(callee) || wrapper(callee) && callee.Blocks != nil {
+				stack = append(stack, callee)
+			} else {
+				if passesError(site.Common().Signature()) {
+					return true
+				}
+				stack = append(stack, c.handedOver(site)...)
+			}
+		}
+		if len(callees) == 0 {
+			stack = append(stack, c.handedOver(site)...)
+		}
+		return false
+	}
+	if wraps(call) {
+		return true
+	}
+	for len(stack) > 0 {
+		fn := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[fn] {
+			continue
+		}
+		seen[fn] = true
+		for _, b := range fn.Blocks {
+			for _, in := range b.Instrs {
+				switch in := in.(type) {
+				case *ssa.MakeInterface:
+					if c.wrappingType(in.X.Type()) {
+						return true
+					}
+				case ssa.CallInstruction:
+					if wraps(in) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// passesError reports whether a call of sig takes an error, alone or as a
+// variadic, and returns one that can wrap it.
+func passesError(sig *types.Signature) bool {
+	r := sig.Results()
+	if r.Len() == 0 || !types.Identical(r.At(r.Len()-1).Type(), errorType) {
+		return false
+	}
+	for i := range sig.Params().Len() {
+		t := sig.Params().At(i).Type()
+		if s, isSlice := t.(*types.Slice); isSlice && sig.Variadic() && i == sig.Params().Len()-1 {
+			t = s.Elem()
+		}
+		if types.Identical(t, errorType) {
+			return true
+		}
+	}
+	return false
+}
+
+// siteCallees returns what site can call: its callees in VTA's graph, or its
+// static callee, or the module methods that can answer an interface method
+// call VTA resolves to nothing.
+func (c *checker) siteCallees(site ssa.CallInstruction) []*ssa.Function {
+	if c.calleesAt == nil {
+		c.calleesAt = map[ssa.CallInstruction][]*ssa.Function{}
+		for _, n := range c.cg.Nodes {
+			for _, e := range n.Out {
+				c.calleesAt[e.Site] = append(c.calleesAt[e.Site], e.Callee.Func)
+			}
+		}
+	}
+	if fns := c.calleesAt[site]; len(fns) > 0 {
+		return fns
+	}
+	cm := site.Common()
+	if cm.IsInvoke() {
+		return c.implementers(cm)
+	}
+	if callee := cm.StaticCallee(); callee != nil {
+		return []*ssa.Function{callee}
+	}
+	return nil
 }
 
 // carried is the error result of call when call passes one of is, as its

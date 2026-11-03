@@ -740,12 +740,22 @@ var errEmpty = errors.New("empty input")
 ```
 
 noalloc follows an error along every path from the call that made it: past
-tests against nil and against a package-level sentinel, through
-reassignments, and into a helper of the module that returns it. An error
-stored in a field, or turned into a result the caller stops on, such as a
-flag or a message, looks swallowed, and its failure is reported. A function
-that calls itself directly counts as called again, but mutual recursion does
-not.
+tests against nil and against a package-level sentinel, through reassignments,
+and into a helper of the module that returns it. A bool that every caller stops
+on, returned or as a field of a returned struct, ends the failure as returning
+the error would. So does returning a sentinel in its place, even when a caller
+tests for that sentinel and goes on. An error stored in a field or turned into
+any other result, such as a message, looks swallowed, and its failure is
+reported. A function that calls itself directly counts as called again, but
+mutual recursion does not.
+
+`errors.Is` with a sentinel of your module counts as a test against that
+sentinel only when nothing the call can run wraps an error, because a dropped
+error that wraps the sentinel would be made again on every iteration. Wrapping
+means `%w`, `errors.Join`, a type with an `Is` or `Unwrap` method, or passing an
+error to a function outside your module that returns one. Failures are also
+reported when the target is a sentinel of another package, or when a helper
+tests the error it takes as a parameter.
 
 ### First-use setup
 

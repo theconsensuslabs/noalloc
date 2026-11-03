@@ -1,6 +1,7 @@
 package noalloc
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,7 +30,11 @@ func checkFrom(t *testing.T, imports []string, src string, source []string) *Res
 	var imp strings.Builder
 	imp.WriteString("import (\n")
 	for _, p := range imports {
-		imp.WriteString("\t\"" + p + "\"\n")
+		if name, path, aliased := strings.Cut(p, " "); aliased {
+			imp.WriteString("\t" + name + " \"" + path + "\"\n")
+		} else {
+			imp.WriteString("\t\"" + p + "\"\n")
+		}
 	}
 	over := strings.Replace(string(b), "import (\n", imp.String(), 1) + src
 	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "fixture", Scratch: []string{"fixture.Scratch"},
@@ -428,5 +433,397 @@ func CountDigits(xs []string) (int, error) {
 `)
 	if flagged(res, "fixture.countDigits", `return 0,fmt.Errorf("no digits in %q",s)`) {
 		t.Error("the error compared with a constant one is taken to be dropped")
+	}
+}
+
+// errorTestShared is what the cases of the errors.Is tests use.
+const errorTestShared = `
+var errDrop = errors.New("drop")
+
+type numErr int
+
+func (e numErr) Error() string { return "number" }
+
+const errConst = numErr(1)
+
+func targetOf() error { return errDrop }
+
+type matcher struct{}
+
+func (matcher) Is(err, target error) bool { return err == target }
+
+type plainErr struct{ s string }
+
+func (e *plainErr) Error() string { return e.s }
+
+type unwrapErr struct{ err error }
+
+func (e *unwrapErr) Error() string { return "unwrap" }
+func (e *unwrapErr) Unwrap() error { return e.err }
+
+type isErr struct{ s string }
+
+func (e *isErr) Error() string        { return e.s }
+func (e *isErr) Is(target error) bool { return target == errDrop }
+
+func wrapFormat() string { return "%q: %w" }
+
+func sentinelOf(s string) error {
+	if s == "" {
+		return errDrop
+	}
+	return nil
+}
+
+func apply(f func() error) error { return f() }
+`
+
+// TestErrorsIsDecidesABranchUnlessTheFailureCanWrap checks each way of testing
+// an error against each way of making one. A failure taken to end the call is
+// not reported. errors.Is decides a branch as a comparison with the sentinel
+// does only when no failure of the call can wrap it, since a wrapped sentinel
+// that the branch drops is allocated on a path that goes on. Every other
+// target, and a function that is not the standard errors.Is, decides nothing.
+func TestErrorsIsDecidesABranchUnlessTheFailureCanWrap(t *testing.T) {
+	const fails = "if err != nil {\n\t\t\treturn 0, err\n\t\t}\n"
+	const drop = "{\n\t\t\tcontinue\n\t\t}\n" + fails
+	const keep = "{\n\t\t\t" + fails + "\t\t\ttotal += n\n\t\t}\n"
+	tests := []struct {
+		name, src string
+		// seesWrap is whether the test is true of a wrapped sentinel.
+		seesWrap bool
+		// undecided is whether the test leaves every failure dropped.
+		undecided bool
+	}{
+		{name: "Eq", src: "if err == errDrop " + drop},
+		{name: "Ne", src: "if err != errDrop " + keep},
+		{name: "Is", src: "if errors.Is(err, errDrop) " + drop, seesWrap: true},
+		{name: "NotIs", src: "if !errors.Is(err, errDrop) " + keep, seesWrap: true},
+		{name: "NonNilNotIs", src: "if err != nil && !errors.Is(err, errDrop) {\n\t\t\treturn 0, err\n\t\t}\n", seesWrap: true},
+		{name: "HeldIs", src: "match := errors.Is(err, errDrop)\n\t\tif match " + drop, seesWrap: true},
+		{name: "HeldNotIs", src: "other := !errors.Is(err, errDrop)\n\t\tif other " + keep, seesWrap: true},
+		{name: "AliasIs", src: "if stderrors.Is(err, errDrop) " + drop, seesWrap: true},
+		{name: "ConstIs", src: "if errors.Is(err, errConst) " + drop, seesWrap: true},
+		{name: "CallTarget", src: "if errors.Is(err, targetOf()) " + drop, undecided: true},
+		{name: "NilTarget", src: "if errors.Is(err, nil) " + drop, undecided: true},
+		{name: "OutsideTarget", src: "if errors.Is(err, strconv.ErrSyntax) " + drop, undecided: true},
+		{name: "ShadowedIs", src: "errors := matcher{}\n\t\tif errors.Is(err, errDrop) " + drop, undecided: true},
+		{name: "OtherPackageIs", src: "if localerrors.Is(err, errDrop) " + drop, undecided: true},
+	}
+	makes := []struct {
+		name, body string
+		wraps      bool
+	}{
+		{name: "Errorf", body: `return 0, fmt.Errorf("FAIL %q", s)`},
+		{name: "New", body: `return 0, &plainErr{"FAIL" + s}`},
+		{name: "ErrorfW", body: `return 0, fmt.Errorf("FAIL %q: %w", s, errDrop)`, wraps: true},
+		{name: "ErrorfWInner", body: "if err := sentinelOf(s); err != nil {\n\t\treturn 0, fmt.Errorf(\"FAIL %q: %w\", s, err)\n\t}\n\treturn 0, nil", wraps: true},
+		{name: "UnknownFormat", body: `return 0, fmt.Errorf(wrapFormat(), "FAIL"+s, errDrop)`, wraps: true},
+		{name: "Join", body: "if s == \"\" {\n\t\treturn 0, fmt.Errorf(\"FAIL %q\", s)\n\t}\n\treturn 0, errors.Join(errDrop, errDrop)", wraps: true},
+		{name: "UnwrapType", body: `return 0, &unwrapErr{errors.New("FAIL")}`, wraps: true},
+		{name: "IsType", body: `return 0, &isErr{"FAIL" + s}`, wraps: true},
+		{name: "Closure", body: "if s == \"\" {\n\t\treturn 0, fmt.Errorf(\"FAIL %q\", s)\n\t}\n\treturn 0, apply(func() error { return fmt.Errorf(\"%q: %w\", s, errDrop) })", wraps: true},
+		{name: "HandedOutside", body: "if s == \"\" {\n\t\treturn 0, fmt.Errorf(\"FAIL %q\", s)\n\t}\n\tvar once sync.Once\n\tvar err error\n\tonce.Do(func() { err = fmt.Errorf(\"%q: %w\", s, errDrop) })\n\treturn 0, err", wraps: true},
+		{name: "OutsideWrap", body: `return 0, os.NewSyscallError("FAIL", errDrop)`, wraps: true},
+		{name: "OutsideUnwrap", body: "if s == \"\" {\n\t\treturn 0, fmt.Errorf(\"FAIL %q\", s)\n\t}\n\treturn 0, errors.Unwrap(errDrop)"},
+	}
+	var src strings.Builder
+	src.WriteString(errorTestShared)
+	for _, tc := range tests {
+		for _, m := range makes {
+			fmt.Fprintf(&src, `
+func make%[1]s%[2]s(s string) (int, error) {
+	if len(s) > 1 {
+		return len(s), nil
+	}
+	%[3]s
+}
+
+//noalloc:root
+func Root%[1]s%[2]s(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := make%[1]s%[2]s(x)
+		%[4]s
+		total += n
+	}
+	return total, nil
+}
+`, tc.name, m.name, m.body, tc.src)
+		}
+	}
+	res := checkWith(t, []string{"os", "stderrors errors", "localerrors fixture/errors"}, src.String())
+	for _, tc := range tests {
+		for _, m := range makes {
+			want := tc.undecided || tc.seesWrap && m.wraps
+			name := "fixture.make" + tc.name + m.name
+			got := slices.ContainsFunc(res.Findings, func(f Finding) bool {
+				return (f.Func == name || strings.HasPrefix(f.Func, name+"$")) && strings.Contains(f.Source, "FAIL")
+			})
+			if got != want {
+				t.Errorf("%s with %s: failure reported %v, want %v", tc.name, m.name, got, want)
+			}
+		}
+	}
+}
+
+// TestErrorsIsFollowsTheCallsThatMakeTheError checks what errors.Is looks past
+// to find a wrap: an argument a helper carries, every method an interface call
+// can reach, and recursion. A parameter's failures come from callers it cannot
+// see, so a test of one decides nothing. An allocation on the arm that handles
+// the sentinel stays reported.
+func TestErrorsIsFollowsTheCallsThatMakeTheError(t *testing.T) {
+	res := checkWith(t, nil, errorTestShared+`
+func madeWrapped(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("carried %q: %w", s, errDrop)
+	}
+	return len(s), nil
+}
+
+func pass(err error) error { return err }
+
+//noalloc:root
+func PassWrapped(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := madeWrapped(x)
+		err = pass(err)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func madePlain(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("plain carried %q", s)
+	}
+	return len(s), nil
+}
+
+//noalloc:root
+func PassPlain(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := madePlain(x)
+		err = pass(err)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func wrapIt(err error) error {
+	if err != nil {
+		return fmt.Errorf("wrapped: %w", err)
+	}
+	return nil
+}
+
+func madeThenWrapped(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("then wrapped %q", s)
+	}
+	return len(s), nil
+}
+
+//noalloc:root
+func WrapInHelper(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := madeThenWrapped(x)
+		err = wrapIt(err)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+type maker interface{ Make(s string) (int, error) }
+
+type plainMaker struct{}
+
+func (plainMaker) Make(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("plain maker %q", s)
+	}
+	return len(s), nil
+}
+
+type wrapMaker struct{}
+
+func (wrapMaker) Make(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("wrap maker %q: %w", s, errDrop)
+	}
+	return len(s), nil
+}
+
+//noalloc:root
+func ThroughInterface(m maker, xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := m.Make(x)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func recurseA(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return recurseB(s[1:])
+}
+
+func recurseB(s string) (int, error) {
+	if s == "x" {
+		return 0, fmt.Errorf("recursed %q: %w", s, errDrop)
+	}
+	return recurseA(s)
+}
+
+//noalloc:root
+func Recursive(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := recurseA(x)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func recursePlainA(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return recursePlainB(s[1:])
+}
+
+func recursePlainB(s string) (int, error) {
+	if s == "x" {
+		return 0, fmt.Errorf("recursed plain %q", s)
+	}
+	return recursePlainA(s)
+}
+
+//noalloc:root
+func RecursivePlain(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := recursePlainA(x)
+		if errors.Is(err, errDrop) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func dropIt(err error) error {
+	if errors.Is(err, errDrop) {
+		return nil
+	}
+	return err
+}
+
+func madeForParameter(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("parameter %q", s)
+	}
+	return len(s), nil
+}
+
+//noalloc:root
+func TestedInHelper(xs []string) (int, error) {
+	total := 0
+	for _, x := range xs {
+		n, err := madeForParameter(x)
+		if err := dropIt(err); err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func madeForArm(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("arm %q", s)
+	}
+	return len(s), nil
+}
+
+//noalloc:root
+func AllocatesOnTheArm(xs []string) (string, error) {
+	out := ""
+	for _, x := range xs {
+		_, err := madeForArm(x)
+		if errors.Is(err, errDrop) {
+			out = out + x
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return out, nil
+}
+`)
+	for _, c := range []struct {
+		fn   string
+		want bool
+	}{
+		{"fixture.madeWrapped", true},
+		{"fixture.madePlain", false},
+		{"fixture.madeThenWrapped", true},
+		{"(fixture.plainMaker).Make", true},
+		{"(fixture.wrapMaker).Make", true},
+		{"fixture.recurseB", true},
+		{"fixture.recursePlainB", false},
+		{"fixture.madeForParameter", true},
+		{"fixture.madeForArm", false},
+		{"fixture.AllocatesOnTheArm", true},
+	} {
+		got := slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Func == c.fn })
+		if got != c.want {
+			t.Errorf("%s: reported %v, want %v", c.fn, got, c.want)
+		}
+	}
+	if t.Failed() {
+		for _, f := range res.Findings {
+			t.Log(f.Func, f.Source)
+		}
 	}
 }
