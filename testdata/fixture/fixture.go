@@ -194,8 +194,8 @@ func runtimeAllocs(sc *Scratch, n int, b []byte, s string) {
 	m[n] = 1                        // want: map write
 	_ = s + "!" + strconv.Quote("") // want: string concatenation, calls strconv.Quote
 	_ = string(b)                   // want: string([]byte)
-	_ = []byte(s)                   // want: []byte(string)
-	go func() {}()                  // want: go statement, escapes
+	_ = []byte(s)
+	go func() {}() // want: go statement, escapes
 	for i := range n {
 		defer done(i) // want: defer in a loop
 	}
@@ -704,7 +704,7 @@ func boxConstants(n int) {
 	anySink = 1.5 * boxedLimit
 	anySink = code(boxedLimit) << 2
 	anySink = n                                   // want: escapes
-	bytesSink = []byte("a constant made a slice") // want: escapes, []byte(string) conversion
+	bytesSink = []byte("a constant made a slice") // want: escapes
 }
 
 var bytesSink []byte

@@ -598,9 +598,8 @@ func TestARestatementThatAddsAnAllocationIsDrift(t *testing.T) {
 }
 
 // TestAConversionRangedOverIsNotACopy checks that converting a string to
-// bytes to range over is not a copy, as the compiler makes none, and that
-// converting bytes to a string to range over, or ranging over a conversion
-// kept in a variable, is.
+// bytes to range over is not a copy, kept in a variable or not, as the compiler
+// makes none, and that converting bytes to a string to range over is.
 func TestAConversionRangedOverIsNotACopy(t *testing.T) {
 	dir, err := filepath.Abs("testdata/fixture")
 	if err != nil {
@@ -639,7 +638,7 @@ func RangeConverted(s string, b []byte) int {
 			got[f.Source] = true
 		}
 	}
-	for src, want := range map[string]bool{"for _,c:=range[]byte(s){": false, "for range string(b){": true, "kept:=[]byte(s)": true} {
+	for src, want := range map[string]bool{"for _,c:=range[]byte(s){": false, "for range string(b){": true, "kept:=[]byte(s)": false} {
 		if got[src] != want {
 			t.Errorf("%s flagged %v, want %v", src, got[src], want)
 		}

@@ -3,7 +3,6 @@ package noalloc
 import (
 	"fmt"
 	"go/types"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -21,8 +20,11 @@ type CrossCheck struct {
 	// Calls are the allocating runtime calls nothing above explains.
 	Calls []RuntimeCall
 	// Buffered are calls on lines Check passed to a runtime function that
-	// allocates only when the compiler gives it no stack buffer, which it
-	// does only for a result escape analysis reports as escaping.
+	// allocates only when its stack buffer cannot hold the result. The buffer
+	// holds a string of one rune, and a string([]byte) of a slice or a
+	// concatenation whose length is known and short, whenever escape analysis
+	// reports the result as not escaping. Other conversions' buffers do not
+	// bound their input.
 	Buffered []RuntimeCall
 	// Unsorted counts the calls reached functions make to runtime functions
 	// known neither to allocate nor not to, by function.
@@ -68,11 +70,13 @@ type runtimeCall struct {
 }
 
 // How a line of a reached function is checked: some of its code checked,
-// some not, and an append or map write on it allowed as reused memory.
+// some not, an append or map write on it allowed as reused memory, and a
+// conversion on it allowed as fitting its stack buffer.
 const (
 	lineChecked = 1 << iota
 	lineUnchecked
 	lineReused
+	lineBuffered
 )
 
 var allocatingRuntime = regexp.MustCompile(`^(growslice|newobject|makeslice|makeslice64|makeslicecopy|makemap|makemap64|makemap_small|` +
@@ -111,10 +115,44 @@ func (c *checker) recordLines(fn *ssa.Function) {
 				c.lineState[p.Filename][p.Line] |= lineUnchecked
 			case c.growsReused(in):
 				c.lineState[p.Filename][p.Line] |= lineChecked | lineReused
+			case fitsBuffer(in):
+				c.lineState[p.Filename][p.Line] |= lineChecked | lineBuffered
+				c.recordConversionSpan(in)
 			default:
 				c.lineState[p.Filename][p.Line] |= lineChecked
+				c.recordConversionSpan(in)
 			}
 		}
+	}
+}
+
+// conversionSpan is a checked conversion written across lines, as seen from one
+// of its later lines. The compiler can place its runtime call there, while Check's
+// finding is at its opening parenthesis.
+type conversionSpan struct {
+	start   int
+	runtime string
+	fits    bool
+}
+
+// recordConversionSpan notes in on its later lines when it is a conversion
+// written across lines.
+func (c *checker) recordConversionSpan(in ssa.Instruction) {
+	conv, ok := in.(*ssa.Convert)
+	if !ok || stringConversion(conv) == "" {
+		return
+	}
+	call, _ := c.callAt(conv.Pos())
+	if call == nil {
+		return
+	}
+	start, end := c.fset.Position(call.Lparen), c.fset.Position(call.Rparen)
+	for line := start.Line + 1; line <= end.Line; line++ {
+		if c.conversionSpans == nil {
+			c.conversionSpans = map[asmPos][]conversionSpan{}
+		}
+		at := asmPos{start.Filename, line}
+		c.conversionSpans[at] = append(c.conversionSpans[at], conversionSpan{start.Line, conversionRuntimeOf(conv), fitsBuffer(conv)})
 	}
 }
 
@@ -178,20 +216,7 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 		return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(sym, p) })
 	}
 
-	// The compiler and the loader can name one file by two paths, as when a
-	// temporary directory is reached through a symbolic link.
-	resolved := map[string]string{}
-	resolve := func(path string) string {
-		if r, ok := resolved[path]; ok {
-			return r
-		}
-		r, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			r = path
-		}
-		resolved[path] = r
-		return r
-	}
+	resolve := c.resolve
 	source := map[string]string{}
 	for f := range c.moduleFiles {
 		source[resolve(f)] = f
@@ -217,6 +242,7 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 	x := &CrossCheck{Unsorted: map[string]int{}, flagged: map[string]bool{}, reused: map[string]bool{}}
 	unmatched := map[string]bool{}
 	seen := map[RuntimeCall]bool{}
+calls:
 	for _, rc := range calls {
 		if !ours(rc.symbol) {
 			continue
@@ -258,6 +284,27 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 			continue
 		}
 		state := c.lineState[file][rc.line]
+		// A call on a later line of a conversion is that conversion's unless a
+		// finding on its own line explains it. Lines can't tell apart two
+		// conversions a call could belong to, so any one of them explains it.
+		spanned, spanFits := false, false
+		for _, span := range c.conversionSpans[asmPos{file, rc.line}] {
+			if span.runtime != rc.fn {
+				continue
+			}
+			spanned = true
+			spanFits = spanFits || span.fits
+			if f := found[c.rel(file)][span.start]; f != nil && explains(f.Reasons, rc.fn) {
+				x.flagged[fmt.Sprintf("%s:%d", c.rel(file), span.start)] = true
+				continue calls
+			}
+		}
+		if spanned {
+			state |= lineChecked
+		}
+		if spanFits {
+			state |= lineBuffered
+		}
 		switch {
 		case state&lineChecked == 0:
 			continue
@@ -279,7 +326,7 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 			continue
 		}
 		seen[r] = true
-		if bufferedRuntime.MatchString(rc.fn) {
+		if bufferedRuntime.MatchString(rc.fn) || state&lineBuffered != 0 && (rc.fn == "slicebytetostring" || strings.HasPrefix(rc.fn, "concatstring")) {
 			x.Buffered = append(x.Buffered, r)
 		} else {
 			x.Calls = append(x.Calls, r)

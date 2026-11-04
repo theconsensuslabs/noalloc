@@ -134,16 +134,15 @@ func (c *checker) loadSummaries(env []string) error {
 			c.reliedOn[l] = true
 		}
 	}
-	c.machineSummaries(env, local, archives)
-	return nil
+	return c.machineSummaries(env, local, archives)
 }
 
 // machineSummaries gives c a summary of each of fns, the module's functions
 // with no Go body, from its machine code: its own, or that of the symbol a
 // //go:linkname binds it to.
-func (c *checker) machineSummaries(env []string, fns []*ssa.Function, archives map[string]string) {
+func (c *checker) machineSummaries(env []string, fns []*ssa.Function, archives map[string]string) error {
 	if len(fns) == 0 {
-		return
+		return nil
 	}
 	mc := newMachineCode(env, archives)
 	mc.assumed = func(sym string) bool {
@@ -164,6 +163,7 @@ func (c *checker) machineSummaries(env []string, fns []*ssa.Function, archives m
 		}
 		c.sums[summaryName(f)] = sum
 	}
+	return mc.err
 }
 
 // summarizer works out summaries over a program built with every package
@@ -321,13 +321,13 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 		all = append(all, p.PkgPath)
 	})
 	type compiled struct {
-		escapes, notes, inlines []escape
-		err                     error
+		escapes, notes, inlines, zeroCopies []escape
+		err                                 error
 	}
 	done := make(chan compiled, 1)
 	go func() {
 		r, err := compilerEscapes(cfg, env, []string{"-gcflags=all=-m"})
-		done <- compiled{r.escapes, r.notes, r.inlines, err}
+		done <- compiled{r.escapes, r.notes, r.inlines, r.zeroCopies, err}
 	}()
 	pkgs, err := packages.Load(&packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 		packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo,
@@ -390,6 +390,7 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 		}
 	}
 	s.inlined = c.positions(comp.inlines)
+	c.zeroCopies = c.positions(comp.zeroCopies)
 	s.inlinedEsc = c.positions(inlinedEscapes(comp.escapes))
 	byName := map[string]*ssa.Function{}
 	for fn := range ssautil.AllFunctions(prog) {
@@ -402,6 +403,9 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 		s.leave(n)
 		sum.Assumed = slices.Sorted(maps.Keys(s.relied[n]))
 		out[n] = sum
+	}
+	if mc.err != nil {
+		return nil, mc.err
 	}
 	return out, nil
 }

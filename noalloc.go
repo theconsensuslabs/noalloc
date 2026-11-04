@@ -42,6 +42,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/callgraph"
@@ -231,6 +232,7 @@ func Check(cfg Config) (*Result, error) {
 		inlines []escape
 		calls   []runtimeCall
 		starts  map[string]asmPos
+		zero    []escape
 		err     error
 	}
 	done := make(chan compiled, 1)
@@ -240,7 +242,7 @@ func Check(cfg Config) (*Result, error) {
 			done <- compiled{err: err}
 			return
 		}
-		done <- compiled{r.escapes, r.notes, r.inlines, r.asm.calls, r.asm.starts, nil}
+		done <- compiled{r.escapes, r.notes, r.inlines, r.asm.calls, r.asm.starts, r.zeroCopies, nil}
 	}()
 	pkgs, err := loadModule(cfg, env, ours)
 	if err != nil {
@@ -315,6 +317,8 @@ func Check(cfg Config) (*Result, error) {
 	escapes := comp.escapes
 	c.inlinedCalls = c.positions(comp.inlines)
 	c.inlinedEscapes = c.positions(inlinedEscapes(escapes))
+	c.zeroCopies = c.positions(comp.zero)
+	c.recordCompiled(comp.calls, comp.starts)
 	c.graph()
 	c.reach(groupRoots(cfg.Groups, roots))
 	c.cover()
@@ -526,6 +530,17 @@ func loadModule(cfg Config, env []string, ours []string) ([]*packages.Package, e
 }
 
 type checker struct {
+	// conversionSpans holds the conversions written across lines, by each of
+	// their later lines.
+	conversionSpans map[asmPos][]conversionSpan
+	// zeroCopies are the []byte(string) conversions the compiler reports it
+	// reads in place. compiledFiles are the files the compiler printed code
+	// for, and conversionCalls the runtime calls on each of their lines.
+	zeroCopies      map[token.Pos]bool
+	compiledFiles   map[string]bool
+	conversionCalls map[conversionCall]bool
+	resolved        map[string]string
+
 	cfg   Config
 	prog  *ssa.Program
 	fset  *token.FileSet
@@ -2877,11 +2892,11 @@ func (c *checker) instrAllocs(in ssa.Instruction) []string {
 			out = append(out, "map write that may grow reused memory")
 		}
 	case *ssa.BinOp:
-		if in.Op == token.ADD && isString(in.Type()) && !c.concatOperand(in) {
+		if in.Op == token.ADD && isString(in.Type()) && !c.concatOperand(in) && !fitsBuffer(in) {
 			out = append(out, "string concatenation")
 		}
 	case *ssa.Convert:
-		if conv := stringConversion(in); conv != "" && !compilerAvoidsCopy(in) && !c.rangedOver(in) {
+		if conv := stringConversion(in); conv != "" && !c.compiledWithoutCopy(in) && !c.compilerAvoidsCopy(in) && !c.rangedOver(in) && !fitsBuffer(in) {
 			out = append(out, conv)
 		}
 	case *ssa.MakeSlice:
@@ -3170,7 +3185,10 @@ func isConst(v ssa.Value) bool {
 }
 
 // stringConversion names in when it copies between a string and a byte or
-// rune slice.
+// rune slice. Each has a stack buffer when its result does not escape, which
+// holds 32 bytes or 32 runes, so past that length a conversion allocates
+// whether or not its result escapes. A string(rune) has one too, but its
+// result always fits, so it is not named here.
 func stringConversion(in *ssa.Convert) string {
 	from, to := in.X.Type(), in.Type()
 	_, fromSlice := from.Underlying().(*types.Slice)
@@ -3184,24 +3202,237 @@ func stringConversion(in *ssa.Convert) string {
 	return ""
 }
 
-// compilerAvoidsCopy reports whether every use of a string([]byte)
-// conversion is one the compiler makes without copying: a map key looked up
-// or a comparison.
-func compilerAvoidsCopy(in *ssa.Convert) bool {
-	if !isString(in.Type()) {
+func isByteSlice(t types.Type) bool {
+	s, ok := t.Underlying().(*types.Slice)
+	if !ok {
+		return false
+	}
+	b, ok := s.Elem().Underlying().(*types.Basic)
+	return ok && b.Kind() == types.Byte
+}
+
+// conversionBufferBytes is the size of the stack buffer the compiler gives a
+// string([]byte) conversion or a concatenation whose result does not escape.
+const conversionBufferBytes = 32
+
+// fitsBuffer reports whether in is a conversion or concatenation whose result
+// has a known length that fits the stack buffer. A result that escapes gets no
+// buffer, which the compiler's escape report shows.
+func fitsBuffer(in ssa.Instruction) bool {
+	v, ok := in.(ssa.Value)
+	if !ok {
+		return false
+	}
+	switch v := v.(type) {
+	case *ssa.Convert:
+		if !isString(v.Type()) || !isByteSlice(v.X.Type()) {
+			return false
+		}
+	case *ssa.BinOp:
+		if v.Op != token.ADD || !isString(v.Type()) {
+			return false
+		}
+	default:
+		return false
+	}
+	n, ok := stringBytes(v)
+	return ok && n <= conversionBufferBytes
+}
+
+// stringBytes returns the most bytes v, a string, can hold, when that is known:
+// a constant, one rune, a byte slice of constant length, or a concatenation of
+// those.
+func stringBytes(v ssa.Value) (int64, bool) {
+	switch v := v.(type) {
+	case *ssa.Const:
+		if v.Value == nil || v.Value.Kind() != constant.String {
+			return 0, false
+		}
+		return int64(len(constant.StringVal(v.Value))), true
+	case *ssa.BinOp:
+		x, ok := stringBytes(v.X)
+		if !ok || v.Op != token.ADD {
+			return 0, false
+		}
+		y, ok := stringBytes(v.Y)
+		return x + y, ok
+	case *ssa.Convert:
+		if b, ok := v.X.Type().Underlying().(*types.Basic); ok && b.Info()&types.IsInteger != 0 {
+			return utf8.UTFMax, true
+		}
+		if s, ok := v.X.(*ssa.Slice); ok && isByteSlice(v.X.Type()) {
+			return sliceLength(s)
+		}
+	}
+	return 0, false
+}
+
+// sliceLength returns the length of s when it is constant.
+func sliceLength(s *ssa.Slice) (int64, bool) {
+	var low int64
+	if s.Low != nil {
+		c, ok := s.Low.(*ssa.Const)
+		if !ok {
+			return 0, false
+		}
+		low = c.Int64()
+	}
+	if s.High != nil {
+		c, ok := s.High.(*ssa.Const)
+		if !ok {
+			return 0, false
+		}
+		return c.Int64() - low, true
+	}
+	p, ok := s.X.Type().Underlying().(*types.Pointer)
+	if !ok {
+		return 0, false
+	}
+	a, ok := p.Elem().Underlying().(*types.Array)
+	if !ok {
+		return 0, false
+	}
+	return a.Len() - low, true
+}
+
+// conversionCall is a runtime function called on a line of a compiled file.
+type conversionCall struct {
+	file    string
+	line    int
+	runtime string
+}
+
+// recordCompiled notes which files the compiler printed code for, and which
+// runtime calls are on their lines.
+func (c *checker) recordCompiled(calls []runtimeCall, starts map[string]asmPos) {
+	c.compiledFiles, c.conversionCalls = map[string]bool{}, map[conversionCall]bool{}
+	for _, at := range starts {
+		c.compiledFiles[c.resolve(at.file)] = true
+	}
+	for _, rc := range calls {
+		c.compiledFiles[c.resolve(rc.file)] = true
+		c.conversionCalls[conversionCall{c.resolve(rc.file), rc.line, rc.fn}] = true
+	}
+}
+
+// resolve follows symbolic links in path, since the compiler and the loader
+// can name one file by two paths.
+func (c *checker) resolve(path string) string {
+	if r, ok := c.resolved[path]; ok {
+		return r
+	}
+	if c.resolved == nil {
+		c.resolved = map[string]string{}
+	}
+	r, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		r = path
+	}
+	c.resolved[path] = r
+	return r
+}
+
+// compiledWithoutCopy reports whether the compiler's output shows in copies
+// nothing: its report names in as a zero-copy conversion, or in's file was
+// compiled and no line of in calls a runtime function that makes this
+// conversion.
+func (c *checker) compiledWithoutCopy(in *ssa.Convert) bool {
+	call, _ := c.callAt(in.Pos())
+	if call == nil {
+		return false
+	}
+	if isString(in.X.Type()) && isByteSlice(in.Type()) {
+		for pos := call.Lparen; pos < call.Rparen; pos++ {
+			if c.zeroCopies[pos] && c.innermostConversion(pos) == call {
+				return true
+			}
+		}
+	}
+	start, end := c.fset.Position(call.Lparen), c.fset.Position(call.Rparen)
+	file := c.resolve(start.Filename)
+	if !c.compiledFiles[file] {
+		return false
+	}
+	runtime := conversionRuntimeOf(in)
+	for line := start.Line; line <= end.Line; line++ {
+		if c.conversionCalls[conversionCall{file, line, runtime}] {
+			return false
+		}
+	}
+	return true
+}
+
+// conversionRuntimeOf names the runtime function that makes in, a conversion
+// stringConversion names.
+func conversionRuntimeOf(in *ssa.Convert) string {
+	switch {
+	case isString(in.Type()) && isByteSlice(in.X.Type()):
+		return "slicebytetostring"
+	case isString(in.Type()):
+		return "slicerunetostring"
+	case isByteSlice(in.Type()):
+		return "stringtoslicebyte"
+	}
+	return "stringtoslicerune"
+}
+
+// innermostConversion returns the innermost conversion to a byte slice that
+// holds pos.
+func (c *checker) innermostConversion(pos token.Pos) *ast.CallExpr {
+	f, info := c.syntax(c.fset.Position(pos).Filename)
+	if f == nil || info == nil {
+		return nil
+	}
+	path, _ := astutil.PathEnclosingInterval(f, pos, pos)
+	for _, n := range path {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || call.Lparen > pos || pos >= call.Rparen {
+			continue
+		}
+		if tv := info.Types[call.Fun]; tv.IsType() && isByteSlice(tv.Type) {
+			return call
+		}
+	}
+	return nil
+}
+
+// compilerAvoidsCopy reports whether the compiler reads the bytes of a
+// string([]byte) conversion in place, which it does for the conversion written
+// directly as a comparison's operand, as a map lookup's key, or as the tag of a
+// switch whose cases are all constants, and for a variable holding it whose one
+// use is a map lookup with memory untouched in between. A rune slice is
+// always copied, and so is a variable compared or switched on.
+func (c *checker) compilerAvoidsCopy(in *ssa.Convert) bool {
+	if !isString(in.Type()) || !isByteSlice(in.X.Type()) {
 		return false
 	}
 	refs := in.Referrers()
-	if refs == nil || len(*refs) == 0 {
+	if refs == nil {
 		return false
+	}
+	conv, parent := c.conversionAt(in.Pos())
+	if conv == nil {
+		return false
+	}
+	if sw, ok := parent.(*ast.SwitchStmt); ok {
+		return sw.Tag == conv && c.constantCases(sw)
+	}
+	if len(*refs) == 0 {
+		return false
+	}
+	if lookedUpNext(in) {
+		return true
 	}
 	for _, r := range *refs {
 		switch r := r.(type) {
 		case *ssa.Lookup:
-			if r.Index != in {
+			if ix, ok := parent.(*ast.IndexExpr); !ok || r.Index != in || ix.Index != conv {
 				return false
 			}
 		case *ssa.BinOp:
+			if _, ok := parent.(*ast.BinaryExpr); !ok {
+				return false
+			}
 			switch r.Op {
 			case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
 			default:
@@ -3214,13 +3445,140 @@ func compilerAvoidsCopy(in *ssa.Convert) bool {
 	return true
 }
 
+// mapFastElemBytes is the largest map element the compiler's specialized
+// string-key lookups take.
+const mapFastElemBytes = 128
+
+var mapSizes = types.SizesFor("gc", "amd64")
+
+// lookedUpNext reports whether the only use of in is as the key of a lookup
+// later in its block, with nothing between them that leavesMemory rejects, in a
+// map whose elements the specialized lookups take.
+func lookedUpNext(in *ssa.Convert) bool {
+	refs := *in.Referrers()
+	if len(refs) != 1 {
+		return false
+	}
+	l, ok := refs[0].(*ssa.Lookup)
+	if !ok || l.Index != in || l.Block() != in.Block() {
+		return false
+	}
+	mapType, ok := l.X.Type().Underlying().(*types.Map)
+	if !ok || mapSizes.Sizeof(mapType.Elem()) > mapFastElemBytes {
+		return false
+	}
+	instrs := in.Block().Instrs
+	for _, i := range instrs[slices.Index(instrs, ssa.Instruction(in))+1:] {
+		if i == ssa.Instruction(l) {
+			return true
+		}
+		if !leavesMemory(i) {
+			return false
+		}
+	}
+	return false
+}
+
+// leavesMemory reports whether i is known to compile to neither a write to
+// memory nor a runtime call, which the compiler's lookup rule needs between a
+// conversion and its lookup.
+func leavesMemory(i ssa.Instruction) bool {
+	switch i := i.(type) {
+	case *ssa.DebugRef, *ssa.FieldAddr, *ssa.Field, *ssa.IndexAddr, *ssa.Extract, *ssa.ChangeType:
+		return true
+	case *ssa.UnOp:
+		// A struct or an array read whole can be copied to the stack.
+		switch i.Type().Underlying().(type) {
+		case *types.Struct, *types.Array:
+			return false
+		}
+		return i.Op != token.ARROW
+	case *ssa.BinOp:
+		// Integer division is a runtime call on some architectures.
+		if i.Op == token.QUO || i.Op == token.REM {
+			return isFloat(i.X.Type())
+		}
+		return isScalar(i.X.Type())
+	case *ssa.Convert:
+		return isScalar(i.X.Type()) && isScalar(i.Type())
+	case *ssa.Call:
+		b, ok := i.Call.Value.(*ssa.Builtin)
+		if !ok || b.Name() != "len" && b.Name() != "cap" {
+			return false
+		}
+		_, isChan := i.Call.Args[0].Type().Underlying().(*types.Chan)
+		return !isChan
+	}
+	return false
+}
+
+// isScalar reports whether t is a real number, a boolean, or a pointer, whose
+// other operations compile to no runtime call. Complex division is a runtime call.
+func isScalar(t types.Type) bool {
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		return u.Info()&(types.IsString|types.IsComplex) == 0
+	case *types.Pointer:
+		return true
+	}
+	return false
+}
+
+func isFloat(t types.Type) bool {
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Info()&types.IsFloat != 0
+}
+
+// conversionAt returns the conversion whose opening parenthesis is at pos, as
+// the outermost expression its parentheses make of it, and what holds that
+// expression.
+func (c *checker) conversionAt(pos token.Pos) (ast.Expr, ast.Node) {
+	f, _ := c.syntax(c.fset.Position(pos).Filename)
+	if f == nil || !pos.IsValid() {
+		return nil, nil
+	}
+	path, _ := astutil.PathEnclosingInterval(f, pos, pos)
+	for i, n := range path {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall || call.Lparen != pos {
+			continue
+		}
+		var expr ast.Expr = call
+		for i++; i < len(path); i++ {
+			p, isParen := path[i].(*ast.ParenExpr)
+			if !isParen {
+				return expr, path[i]
+			}
+			expr = p
+		}
+	}
+	return nil, nil
+}
+
+// constantCases reports whether every case of sw is a constant.
+func (c *checker) constantCases(sw *ast.SwitchStmt) bool {
+	_, info := c.syntax(c.fset.Position(sw.Pos()).Filename)
+	if info == nil {
+		return false
+	}
+	for _, s := range sw.Body.List {
+		for _, e := range s.(*ast.CaseClause).List {
+			if info.Types[e].Value == nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // rangedOver reports whether in converts a string to a byte slice as the
 // expression a for statement ranges over, which the compiler reads in place,
 // the string's bytes being immutable. Bytes converted to a string to range
-// over are copied, since the loop can change them.
+// over are copied, since the loop can change them, and a string converted to
+// runes is decoded into a copy.
 func (c *checker) rangedOver(in *ssa.Convert) bool {
 	pos := in.Pos()
-	if !pos.IsValid() || !isString(in.X.Type()) {
+	if !pos.IsValid() || !isString(in.X.Type()) || !isByteSlice(in.Type()) {
 		return false
 	}
 	call, outer := c.callAt(pos)
@@ -3956,7 +4314,7 @@ var diagLine = regexp.MustCompile(`^(.+\.go):(\d+):(\d+): (.*)$`)
 // assembly for the module's packages, and returns the heap allocations it
 // reports and the runtime calls their compiled code makes.
 func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport, error) {
-	var escapes, notes, inlines []escape
+	var escapes, notes, inlines, zeroCopies []escape
 	asm := &asmReader{seen: map[string]bool{}, starts: map[string]asmPos{}}
 	seen := map[escape]bool{}
 	var overlay []string
@@ -3980,15 +4338,18 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 	}
 	paths := map[string]string{}
 	const flags = "-m -S"
-	for _, pat := range cfg.Patterns {
+	for _, group := range patternGroups(cfg.Patterns) {
 		args := append([]string{"build"}, overlay...)
 		args = append(args, gcflags...)
 		if gcflags == nil {
 			for _, m := range append([]string{cfg.Module}, cfg.SourceModules...) {
 				args = append(args, "-gcflags="+m+"/...="+flags)
 			}
+			if strings.HasSuffix(group[0], ".go") {
+				args = append(args, "-gcflags=command-line-arguments="+flags)
+			}
 		}
-		args = append(args, "-o", os.DevNull, pat)
+		args = append(append(args, "-o", os.DevNull), group...)
 		cmd := exec.Command("go", args...)
 		cmd.Dir, cmd.Env = cfg.Dir, env
 		// The assembly of a large module runs to hundreds of megabytes, so it
@@ -4040,6 +4401,8 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 					inlines = append(inlines, at)
 				}
 				inlined[at]++
+			case msg == "zero-copy string->[]byte conversion":
+				zeroCopies = append(zeroCopies, at)
 			case msg == "append escapes to heap":
 				// A growing append is the append rule's, which knows the Scratch.
 			case strings.HasPrefix(msg, "moved to heap: "), strings.HasSuffix(msg, " escapes to heap"):
@@ -4071,15 +4434,34 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 			}
 		}
 	}
-	return compilerReport{escapes, notes, inlines, asm}, nil
+	return compilerReport{escapes, notes, inlines, zeroCopies, asm}, nil
+}
+
+// patternGroups splits patterns into what one go build takes: each package
+// pattern alone, and the .go files together, since they are one package.
+func patternGroups(patterns []string) [][]string {
+	var groups [][]string
+	var files []string
+	for _, p := range patterns {
+		if strings.HasSuffix(p, ".go") {
+			files = append(files, p)
+		} else {
+			groups = append(groups, []string{p})
+		}
+	}
+	if len(files) > 0 {
+		groups = append(groups, files)
+	}
+	return groups
 }
 
 // compilerReport is what compilerEscapes reads off the compiler: its
 // escapes; notes, where it reported anything of its escape analysis; inlines,
-// where it inlined a call; and the assembly it printed.
+// where it inlined a call; zeroCopies, the []byte(string) conversions it reads
+// in place; and the assembly it printed.
 type compilerReport struct {
-	escapes, notes, inlines []escape
-	asm                     *asmReader
+	escapes, notes, inlines, zeroCopies []escape
+	asm                                 *asmReader
 }
 
 // reportedFile is the file at path, as the compiler's report gives it, built

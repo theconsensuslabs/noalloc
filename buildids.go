@@ -42,7 +42,10 @@ type buildPackage struct {
 }
 
 // buildPackages compiles the packages of cfg's build as go build would, and
-// returns each one they depend on.
+// returns each one they depend on, with the runtime and what it depends on.
+// Every program links those, and assembly reaches them with no import, as
+// sync/atomic's does, so go list -deps of a library can leave them out. They
+// are listed apart because go list takes no import path beside .go files.
 func buildPackages(cfg Config, env []string) ([]buildPackage, error) {
 	args := []string{"list", "-deps", "-export", "-f", "{{.ImportPath}}\t{{.Export}}\t{{.BuildID}}"}
 	if len(cfg.Overlay) > 0 {
@@ -57,8 +60,29 @@ func buildPackages(cfg Config, env []string) ([]buildPackage, error) {
 		}
 		args = append(args, "-overlay", f)
 	}
-	cmd := exec.Command("go", append(args, cfg.Patterns...)...)
-	cmd.Dir, cmd.Env = cfg.Dir, env
+	pkgs, err := listPackages(cfg.Dir, env, append(slices.Clone(args), cfg.Patterns...))
+	if err != nil {
+		return nil, err
+	}
+	if slices.ContainsFunc(pkgs, func(p buildPackage) bool { return p.path == "runtime" }) {
+		return pkgs, nil
+	}
+	linked, err := listPackages(cfg.Dir, env, append(args, "runtime"))
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range linked {
+		if !slices.ContainsFunc(pkgs, func(q buildPackage) bool { return q.path == p.path }) {
+			pkgs = append(pkgs, p)
+		}
+	}
+	return pkgs, nil
+}
+
+// listPackages runs go with args, a go list printing a buildPackage per line.
+func listPackages(dir string, env, args []string) ([]buildPackage, error) {
+	cmd := exec.Command("go", args...)
+	cmd.Dir, cmd.Env = dir, env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()

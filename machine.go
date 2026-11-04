@@ -24,6 +24,7 @@ type machineCode struct {
 	enter, leave func(sym string)
 	env          []string
 	archives     map[string]string             // package path -> archive
+	err          error                         // the first archive that could not be read
 	text         map[string]map[string]textSym // package path -> symbol -> code
 	alloc        memo[string]
 	ret          memo[string]
@@ -48,6 +49,9 @@ type textSym struct {
 	tails    []string // the functions it jumps to, returning as they do
 	closures []string // the closures it takes the address of
 }
+
+// testHookDisassemble, when set, can fail a disassembly of an archive.
+var testHookDisassemble func(archive string) error
 
 // newMachineCode reads code from archives, each package's from go list
 // -export: the archives the build being checked compiles and links.
@@ -83,6 +87,9 @@ func (m *machineCode) symbols(path string) map[string]textSym {
 	}
 	out, err := m.disassemble(a)
 	if err != nil {
+		if m.err == nil {
+			m.err = err
+		}
 		return t
 	}
 	m.parse(path, out, t)
@@ -234,6 +241,11 @@ func branchTo(l string) (sym string, indirect bool) {
 // disassemble returns the code of every object in archive a: objdump reads
 // only an archive's compiled Go, and its assembly is in objects of its own.
 func (m *machineCode) disassemble(a string) ([]byte, error) {
+	if testHookDisassemble != nil {
+		if err := testHookDisassemble(a); err != nil {
+			return nil, err
+		}
+	}
 	tmp, err := os.MkdirTemp("", "noalloc-objects")
 	if err != nil {
 		return nil, err
@@ -305,7 +317,7 @@ func (m *machineCode) reaches(sym string) bool {
 			if allocator.MatchString(name) {
 				return m.because(sym, sym+" is the runtime's allocator", "")
 			}
-			if callsC.MatchString(name) || growsStack.MatchString(name) {
+			if callsC.MatchString(name) || growsStack.MatchString(name) || name == atomicWriteBarrier {
 				return false
 			}
 		}
@@ -348,6 +360,11 @@ var callsC = regexp.MustCompile(`^(asmcgocall(_no_g)?|systemstack|mcall)$`)
 // growsStack are the runtime functions that grow a goroutine's stack, which
 // takes memory from the runtime's stack pools, not the heap.
 var growsStack = regexp.MustCompile(`^morestack(_noctxt)?$`)
+
+// atomicWriteBarrier is the write barrier of sync/atomic's pointer stores, as
+// gcWriteBarrier is of the compiler's. Its flush feeds the collector and takes
+// no memory from the heap for the caller.
+const atomicWriteBarrier = "atomicwb"
 
 // because notes why sym allocates, and the symbol to follow, and reports
 // that it does.
