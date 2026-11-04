@@ -24,6 +24,7 @@ package noalloc
 
 import (
 	"bufio"
+	"cmp"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -227,22 +228,13 @@ func Check(cfg Config) (*Result, error) {
 	}
 	// The compiler's escape report and the load run at once.
 	type compiled struct {
-		escapes []escape
-		notes   []escape
-		inlines []escape
-		calls   []runtimeCall
-		starts  map[string]asmPos
-		zero    []escape
-		err     error
+		compilerReport
+		err error
 	}
 	done := make(chan compiled, 1)
 	go func() {
 		r, err := compilerEscapes(cfg, env, nil)
-		if err != nil {
-			done <- compiled{err: err}
-			return
-		}
-		done <- compiled{r.escapes, r.notes, r.inlines, r.asm.calls, r.asm.starts, r.zeroCopies, nil}
+		done <- compiled{r, err}
 	}()
 	pkgs, err := loadModule(cfg, env, ours)
 	if err != nil {
@@ -317,8 +309,11 @@ func Check(cfg Config) (*Result, error) {
 	escapes := comp.escapes
 	c.inlinedCalls = c.positions(comp.inlines)
 	c.inlinedEscapes = c.positions(inlinedEscapes(escapes))
-	c.zeroCopies = c.positions(comp.zero)
-	c.recordCompiled(comp.calls, comp.starts)
+	c.zeroCopies = c.positions(comp.zeroCopies)
+	defer comp.asm.close()
+	if err := c.recordCompiled(comp.asm); err != nil {
+		return nil, err
+	}
 	c.graph()
 	c.reach(groupRoots(cfg.Groups, roots))
 	c.cover()
@@ -371,7 +366,9 @@ func Check(cfg Config) (*Result, error) {
 		}
 	}
 	c.matchEscapes(escapes, comp.notes, add)
-	res.CrossCheck = c.crossCheck(comp.calls, comp.starts, found)
+	if res.CrossCheck, err = c.crossCheck(comp.asm, found); err != nil {
+		return nil, err
+	}
 	for f, kind := range c.allow.assumed {
 		res.Assumptions = append(res.Assumptions, Assumption{Kind: kind, Func: f, Used: c.reliedOn[f] || c.allow.used[f]})
 	}
@@ -530,6 +527,14 @@ func loadModule(cfg Config, env []string, ours []string) ([]*packages.Package, e
 }
 
 type checker struct {
+	// compiledCode, when set, answers from a package's archive whether a
+	// conversion on lines from to to of a file is made without runtime.
+	compiledCode func(in *ssa.Convert, file string, from, to int, runtime string) bool
+	// bufferedLines, when set, gathers the lines of conversions and
+	// concatenations found to fit their stack buffer, by file name.
+	bufferedLines map[asmPos]bool
+	allFuncs      []*ssa.Function
+	orderNames    map[*ssa.Function]string
 	// conversionSpans holds the conversions written across lines, by each of
 	// their later lines.
 	conversionSpans map[asmPos][]conversionSpan
@@ -1066,10 +1071,61 @@ func enclosingFunc(p *packages.Package, f *ast.File, pos token.Pos) string {
 }
 
 // graph builds the call graph: VTA over every function of the module, which
-// sees where values get their concrete types, starting from CHA.
+// sees where values get their concrete types, starting from CHA. Each
+// function's calls are in the order of its code, and each call's callees by
+// name, so what is found first does not change between runs.
 func (c *checker) graph() {
 	c.cha = cha.CallGraph(c.prog)
 	c.cg = vta.CallGraph(ssautil.AllFunctions(c.prog), c.cha)
+	for _, n := range c.cg.Nodes {
+		order := map[ssa.CallInstruction]int{}
+		for _, b := range n.Func.Blocks {
+			for _, in := range b.Instrs {
+				if call, ok := in.(ssa.CallInstruction); ok {
+					order[call] = len(order)
+				}
+			}
+		}
+		slices.SortStableFunc(n.Out, func(a, b *callgraph.Edge) int {
+			if a.Site != b.Site {
+				return cmp.Compare(order[a.Site], order[b.Site])
+			}
+			return c.compareFuncs(a.Callee.Func, b.Callee.Func)
+		})
+	}
+}
+
+// compareFuncs orders functions by what stays the same between runs: name,
+// then what distinguishes functions of one name.
+func (c *checker) compareFuncs(a, b *ssa.Function) int {
+	if a == b {
+		return 0
+	}
+	return cmp.Or(strings.Compare(c.orderName(a), c.orderName(b)), strings.Compare(a.Synthetic, b.Synthetic),
+		strings.Compare(c.fset.Position(a.Pos()).String(), c.fset.Position(b.Pos()).String()))
+}
+
+// orderName is the name compareFuncs orders fn by.
+func (c *checker) orderName(fn *ssa.Function) string {
+	if n, ok := c.orderNames[fn]; ok {
+		return n
+	}
+	if c.orderNames == nil {
+		c.orderNames = map[*ssa.Function]string{}
+	}
+	n := canonicalTypes(fn.String())
+	c.orderNames[fn] = n
+	return n
+}
+
+// allFunctions is every function of the program, in the order compareFuncs
+// gives them.
+func (c *checker) allFunctions() []*ssa.Function {
+	if c.allFuncs == nil {
+		c.allFuncs = slices.Collect(maps.Keys(ssautil.AllFunctions(c.prog)))
+		slices.SortFunc(c.allFuncs, c.compareFuncs)
+	}
+	return c.allFuncs
 }
 
 // rootGroup is the roots of one group.
@@ -2798,7 +2854,7 @@ func (c *checker) handGrownAt(file string, line int, msg string) bool {
 func (c *checker) funcsAt(file string, line int) []*ssa.Function {
 	if c.byLine == nil {
 		c.byLine = map[string]map[int][]*ssa.Function{}
-		for fn := range ssautil.AllFunctions(c.prog) {
+		for _, fn := range c.allFunctions() {
 			if fn.Syntax() == nil {
 				continue
 			}
@@ -2892,11 +2948,11 @@ func (c *checker) instrAllocs(in ssa.Instruction) []string {
 			out = append(out, "map write that may grow reused memory")
 		}
 	case *ssa.BinOp:
-		if in.Op == token.ADD && isString(in.Type()) && !c.concatOperand(in) && !fitsBuffer(in) {
+		if in.Op == token.ADD && isString(in.Type()) && !c.concatOperand(in) && !c.fitsBufferAt(in) {
 			out = append(out, "string concatenation")
 		}
 	case *ssa.Convert:
-		if conv := stringConversion(in); conv != "" && !c.compiledWithoutCopy(in) && !c.compilerAvoidsCopy(in) && !c.rangedOver(in) && !fitsBuffer(in) {
+		if conv := stringConversion(in); conv != "" && !c.compiledWithoutCopy(in) && !c.compilerAvoidsCopy(in) && !c.rangedOver(in) && !c.fitsBufferAt(in) {
 			out = append(out, conv)
 		}
 	case *ssa.MakeSlice:
@@ -3215,6 +3271,24 @@ func isByteSlice(t types.Type) bool {
 // string([]byte) conversion or a concatenation whose result does not escape.
 const conversionBufferBytes = 32
 
+// fitsBufferAt is fitsBuffer, noting the line of what fits.
+func (c *checker) fitsBufferAt(in ssa.Instruction) bool {
+	if !fitsBuffer(in) {
+		return false
+	}
+	if c.bufferedLines != nil {
+		from := c.fset.Position(in.Pos())
+		to := from.Line
+		if call, _ := c.callAt(in.Pos()); call != nil {
+			from, to = c.fset.Position(call.Lparen), c.fset.Position(call.Rparen).Line
+		}
+		for line := from.Line; line <= to; line++ {
+			c.bufferedLines[asmPos{filepath.Base(from.Filename), line}] = true
+		}
+	}
+	return true
+}
+
 // fitsBuffer reports whether in is a conversion or concatenation whose result
 // has a known length that fits the stack buffer. A result that escapes gets no
 // buffer, which the compiler's escape report shows.
@@ -3303,16 +3377,16 @@ type conversionCall struct {
 }
 
 // recordCompiled notes which files the compiler printed code for, and which
-// runtime calls are on their lines.
-func (c *checker) recordCompiled(calls []runtimeCall, starts map[string]asmPos) {
+// conversions' runtime calls are on their lines.
+func (c *checker) recordCompiled(asm *asmReader) error {
 	c.compiledFiles, c.conversionCalls = map[string]bool{}, map[conversionCall]bool{}
-	for _, at := range starts {
-		c.compiledFiles[c.resolve(at.file)] = true
-	}
-	for _, rc := range calls {
-		c.compiledFiles[c.resolve(rc.file)] = true
-		c.conversionCalls[conversionCall{c.resolve(rc.file), rc.line, rc.fn}] = true
-	}
+	return asm.each(func(rc runtimeCall) {
+		file := c.resolve(rc.file)
+		c.compiledFiles[file] = true
+		if rc.fn != "" {
+			c.conversionCalls[conversionCall{file, rc.line, rc.fn}] = true
+		}
+	}, nil)
 }
 
 // resolve follows symbolic links in path, since the compiler and the loader
@@ -3349,11 +3423,14 @@ func (c *checker) compiledWithoutCopy(in *ssa.Convert) bool {
 		}
 	}
 	start, end := c.fset.Position(call.Lparen), c.fset.Position(call.Rparen)
+	runtime := conversionRuntimeOf(in)
+	if c.compiledCode != nil {
+		return c.compiledCode(in, filepath.Base(start.Filename), start.Line, end.Line, runtime)
+	}
 	file := c.resolve(start.Filename)
 	if !c.compiledFiles[file] {
 		return false
 	}
-	runtime := conversionRuntimeOf(in)
 	for line := start.Line; line <= end.Line; line++ {
 		if c.conversionCalls[conversionCall{file, line, runtime}] {
 			return false
@@ -3494,10 +3571,6 @@ func leavesMemory(i ssa.Instruction) bool {
 		}
 		return i.Op != token.ARROW
 	case *ssa.BinOp:
-		// Integer division is a runtime call on some architectures.
-		if i.Op == token.QUO || i.Op == token.REM {
-			return isFloat(i.X.Type())
-		}
 		return isScalar(i.X.Type())
 	case *ssa.Convert:
 		return isScalar(i.X.Type()) && isScalar(i.Type())
@@ -3522,11 +3595,6 @@ func isScalar(t types.Type) bool {
 		return true
 	}
 	return false
-}
-
-func isFloat(t types.Type) bool {
-	b, ok := t.Underlying().(*types.Basic)
-	return ok && b.Info()&types.IsFloat != 0
 }
 
 // conversionAt returns the conversion whose opening parenthesis is at pos, as
@@ -3883,7 +3951,7 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 			reached[fn.Syntax()] = append(reached[fn.Syntax()], fn)
 		}
 	}
-	for fn := range ssautil.AllFunctions(c.prog) {
+	for _, fn := range c.allFunctions() {
 		if !c.ours(fn) || fn.Syntax() == nil {
 			continue
 		}
@@ -4165,7 +4233,7 @@ var zeroSize = types.SizesFor("gc", "amd64")
 // parenthesis as the compiler reports an inlined call at, to its callee.
 func (c *checker) staticCallees() map[token.Pos]*ssa.Function {
 	out := map[token.Pos]*ssa.Function{}
-	for fn := range ssautil.AllFunctions(c.prog) {
+	for _, fn := range c.allFunctions() {
 		if !c.ours(fn) {
 			continue
 		}
@@ -4315,7 +4383,7 @@ var diagLine = regexp.MustCompile(`^(.+\.go):(\d+):(\d+): (.*)$`)
 // reports and the runtime calls their compiled code makes.
 func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport, error) {
 	var escapes, notes, inlines, zeroCopies []escape
-	asm := &asmReader{seen: map[string]bool{}, starts: map[string]asmPos{}}
+	asm := &asmReader{}
 	seen := map[escape]bool{}
 	var overlay []string
 	if len(cfg.Overlay) > 0 {

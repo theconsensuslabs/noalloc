@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/ssa"
-	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // CrossCheck holds the compiled code of the reached functions to what Check
@@ -182,7 +181,7 @@ func (c *checker) growsReused(in ssa.Instruction) bool {
 }
 
 // crossCheck holds calls, from the compiled module, to what Check found.
-func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, found map[string]map[int]*Finding) *CrossCheck {
+func (c *checker) crossCheck(asm *asmReader, found map[string]map[int]*Finding) (*CrossCheck, error) {
 	reached, known := map[string]bool{}, map[string]bool{}
 	names := map[string]string{}
 	for _, fn := range c.order {
@@ -194,7 +193,7 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 	// A closure or a range-over-func loop body the compiler numbers apart from
 	// SSA is found where it starts instead.
 	nested := map[asmPos][]*ssa.Function{}
-	for fn := range ssautil.AllFunctions(c.prog) {
+	for _, fn := range c.allFunctions() {
 		if !c.ours(fn) {
 			continue
 		}
@@ -242,14 +241,17 @@ func (c *checker) crossCheck(calls []runtimeCall, starts map[string]asmPos, foun
 	x := &CrossCheck{Unsorted: map[string]int{}, flagged: map[string]bool{}, reused: map[string]bool{}}
 	unmatched := map[string]bool{}
 	seen := map[RuntimeCall]bool{}
-calls:
-	for _, rc := range calls {
+	starts := map[string]asmPos{}
+	record := func(rc runtimeCall) {
+		if rc.fn == "" {
+			return
+		}
 		if !ours(rc.symbol) {
-			continue
+			return
 		}
 		sym := compiledSymbol(rc.symbol)
 		if sym == "" {
-			continue
+			return
 		}
 		// The pointer method the compiler makes for a value method holds its body.
 		if v := pointerWrapper.ReplaceAllString(sym, "$1$2."); !known[sym] && known[v] {
@@ -266,22 +268,22 @@ calls:
 			if _, inModule := source[resolve(rc.file)]; allocatingRuntime.MatchString(rc.fn) && inModule {
 				unmatched[rc.symbol] = true
 			}
-			continue
+			return
 		}
 		if !reached[sym] {
-			continue
+			return
 		}
 		switch {
 		case nonAllocatingRuntime.MatchString(rc.fn):
-			continue
+			return
 		case !allocatingRuntime.MatchString(rc.fn):
 			x.Unsorted[rc.fn]++
-			continue
+			return
 		}
 		file, ok := source[resolve(rc.file)]
 		if !ok {
 			x.Elsewhere++
-			continue
+			return
 		}
 		state := c.lineState[file][rc.line]
 		// A call on a later line of a conversion is that conversion's unless a
@@ -296,7 +298,7 @@ calls:
 			spanFits = spanFits || span.fits
 			if f := found[c.rel(file)][span.start]; f != nil && explains(f.Reasons, rc.fn) {
 				x.flagged[fmt.Sprintf("%s:%d", c.rel(file), span.start)] = true
-				continue calls
+				return
 			}
 		}
 		if spanned {
@@ -307,23 +309,23 @@ calls:
 		}
 		switch {
 		case state&lineChecked == 0:
-			continue
+			return
 		case state&lineUnchecked != 0:
 			x.Mixed++
-			continue
+			return
 		case found[c.rel(file)][rc.line] != nil && explains(found[c.rel(file)][rc.line].Reasons, rc.fn):
 			x.flagged[fmt.Sprintf("%s:%d", c.rel(file), rc.line)] = true
-			continue
+			return
 		case state&lineReused != 0 && (rc.fn == "growslice" || strings.HasPrefix(rc.fn, "mapassign")):
 			x.reused[fmt.Sprintf("%s:%d", c.rel(file), rc.line)] = true
-			continue
+			return
 		case slices.ContainsFunc(inlinedBodies, func(b lines) bool { return b.file == file && b.start <= rc.line && rc.line <= b.end }):
 			x.flagged[fmt.Sprintf("%s:%d", c.rel(file), rc.line)] = true
-			continue
+			return
 		}
 		r := RuntimeCall{File: c.rel(file), Line: rc.line, Source: c.lineTokens(file, rc.line), Func: rc.symbol, Runtime: rc.fn}
 		if seen[r] {
-			continue
+			return
 		}
 		seen[r] = true
 		if bufferedRuntime.MatchString(rc.fn) || state&lineBuffered != 0 && (rc.fn == "slicebytetostring" || strings.HasPrefix(rc.fn, "concatstring")) {
@@ -331,6 +333,9 @@ calls:
 		} else {
 			x.Calls = append(x.Calls, r)
 		}
+	}
+	if err := asm.each(record, func(symbol string, at asmPos) { starts[symbol] = at }); err != nil {
+		return nil, err
 	}
 	x.Unmatched = slices.Sorted(func(yield func(string) bool) {
 		for s := range unmatched {
@@ -346,7 +351,7 @@ calls:
 		return a.Line - b.Line
 	})
 	x.Flagged, x.Reused = len(x.flagged), len(x.reused)
-	return x
+	return x, nil
 }
 
 // explainedBy are the words of a finding's reason that account for a call to
@@ -467,15 +472,14 @@ func stripTypeArgs(name string) string {
 
 var asmCall = regexp.MustCompile(`\((/.+\.go):(\d+)\)\tCALL\truntime\.([A-Za-z0-9_]+)\(SB\)`)
 
-// asmReader collects the runtime calls in the compiler's -S output, each
-// under the function the last STEXT header named.
+// asmReader reads the runtime calls in the compiler's -S output, each under the
+// function the last STEXT header named. However much it reads it holds a fixed
+// amount, what it reads going to a file that each reads back.
 type asmReader struct {
 	symbol string
-	skip   bool
-	seen   map[string]bool
-	calls  []runtimeCall
-	// starts holds the file and line each function's first instruction is at.
-	starts map[string]asmPos
+	// started is whether symbol's first instruction has been seen.
+	started bool
+	spill   spillFile
 }
 
 type asmPos struct {
@@ -491,29 +495,52 @@ func (a *asmReader) line(l string) {
 	}
 	if l[0] != '\t' && l[0] != ' ' {
 		if i := strings.Index(l, " STEXT"); i > 0 {
-			a.symbol = l[:i]
-			// The same function compiled for another pattern prints again.
-			a.skip = a.seen[a.symbol]
-			a.seen[a.symbol] = true
+			a.symbol, a.started = l[:i], false
 		}
 		return
 	}
-	if a.skip {
-		return
-	}
-	if _, ok := a.starts[a.symbol]; !ok {
+	if !a.started {
 		if m := asmPosition.FindStringSubmatch(l); m != nil {
-			n, _ := strconv.Atoi(m[2])
-			a.starts[a.symbol] = asmPos{m[1], n}
+			a.started = true
+			a.spill.write(a.symbol, m[1], m[2], "")
 		}
 	}
 	if !strings.Contains(l, "\tCALL\truntime.") {
 		return
 	}
-	m := asmCall.FindStringSubmatch(l)
-	if m == nil {
-		return
+	if m := asmCall.FindStringSubmatch(l); m != nil {
+		a.spill.write(a.symbol, m[1], m[2], m[3])
 	}
-	n, _ := strconv.Atoi(m[2])
-	a.calls = append(a.calls, runtimeCall{symbol: a.symbol, file: m[1], line: n, fn: m[3]})
 }
+
+// each calls call with each runtime call read and, when set, start with where
+// each function's first instruction is. It also calls call with that first
+// instruction's place and no fn, so a file with no runtime call counts as
+// compiled. A function compiled again, for another pattern or as another
+// package's copy of a generic instance, counts once: its first copy.
+func (a *asmReader) each(call func(runtimeCall), start func(symbol string, at asmPos)) error {
+	seen := map[string]bool{}
+	skip := false
+	return a.spill.each(func(f []string) {
+		if len(f) != 4 {
+			return
+		}
+		line, _ := strconv.Atoi(f[2])
+		if f[3] == "" {
+			skip = seen[f[0]]
+			if !skip {
+				seen[f[0]] = true
+				if start != nil {
+					start(f[0], asmPos{f[1], line})
+				}
+				call(runtimeCall{symbol: f[0], file: f[1], line: line})
+			}
+			return
+		}
+		if !skip {
+			call(runtimeCall{symbol: f[0], file: f[1], line: line, fn: f[3]})
+		}
+	})
+}
+
+func (a *asmReader) close() { a.spill.close() }

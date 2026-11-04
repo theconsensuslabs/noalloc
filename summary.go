@@ -1,6 +1,7 @@
 package noalloc
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"go/ast"
@@ -10,12 +11,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
-	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // A summary is what a call to a function outside the module allocates,
@@ -50,6 +52,18 @@ type summary struct {
 // summaryFormat names how summaries are worked out, so that a cache written
 // another way is not read.
 const summaryFormat = "5"
+
+// testHookCompiledCode, when set, can answer that a conversion is compiled
+// without a copy whatever its code says.
+var testHookCompiledCode func(in *ssa.Convert) bool
+
+// testHookMissesBuiltin, when set, can leave out what a builtin's call allocates,
+// as a mistaken reading of a dependency's source would.
+var testHookMissesBuiltin func(in ssa.Instruction) bool
+
+// testHookSummariesChecked sees how many questions each cross-check of
+// summaries asked.
+var testHookSummariesChecked func(asked int)
 
 // testHookSummarize sees the functions each Check summarizes from source,
 // past what its cache held. Only tests set it.
@@ -90,6 +104,7 @@ func (c *checker) loadSummaries(env []string) error {
 			}
 		}
 	}
+	slices.SortFunc(local, c.compareFuncs)
 	pkgs, err := buildPackages(c.cfg, env)
 	if err != nil {
 		return err
@@ -189,50 +204,69 @@ type summarizer struct {
 	// linknames maps a function declared with no body, as its package and
 	// name, to the symbol a //go:linkname directive binds it to.
 	linknames map[string]string
-	// whys holds, for each summary that allocates, the first step found
-	// toward what allocates.
-	whys map[sumKey]why
 	// noted holds where the compiler reported anything, and calls the
 	// callee of each call, by its position, for escapes at inlined calls.
 	noted map[string][]token.Pos
 	calls map[token.Pos]*ssa.Function
+	// judged holds the functions with a conversion their compiled code says
+	// makes no copy, in the order found, and worked out the keys of each
+	// function that decide which of its blocks run.
+	judged     map[*ssa.Function]bool
+	judgedList []*ssa.Function
+	workedOut  map[*ssa.Function]map[string]bool
+}
+
+// judge notes that fn holds a conversion judged by its compiled code.
+func (s *summarizer) judge(fn *ssa.Function) {
+	if !s.judged[fn] {
+		s.judged[fn] = true
+		s.judgedList = append(s.judgedList, fn)
+	}
 }
 
 // A why is one step toward an allocation, and what to follow from it: a
-// summary, or the machine code of a symbol.
+// summary, or nothing when the step is the allocation.
 type why struct {
-	step    string
-	next    *sumKey
-	nextSym string
+	step string
+	next *sumKey
 }
 
-// because notes why the summary k allocates, and reports that it does.
-func (s *summarizer) because(k sumKey, w why) bool {
-	if _, ok := s.whys[k]; !ok {
-		s.whys[k] = w
-	}
-	return true
-}
-
-// chain is why the summary k allocates, from k to the allocation.
+// chain is why the summary k allocates, from k to the allocation: the first
+// way in the order of the code, which does not depend on what was worked out
+// before it.
 func (s *summarizer) chain(k sumKey) string {
-	var steps []string
-	for range 24 {
-		w, ok := s.whys[k]
-		if !ok {
-			break
-		}
-		steps = append(steps, w.step)
-		if w.nextSym != "" {
-			steps = append(steps, s.mc.chain(w.nextSym)...)
-			break
-		}
-		if w.next == nil {
-			break
-		}
-		k = *w.next
+	// What the walk asks relies on nothing the summary keeps.
+	s.enter(&k)
+	defer s.leave(&k, true)
+	steps, _ := s.explain(k, map[sumKey]bool{})
+	return strings.Join(steps[:min(len(steps), chainSteps)], " > ")
+}
+
+// chainSteps bounds how many steps a chain is written with.
+const chainSteps = 24
+
+// explain is the steps from k to an allocation that pass through no summary
+// in seen, and whether there are any.
+func (s *summarizer) explain(k sumKey, seen map[sumKey]bool) ([]string, bool) {
+	k = s.normalKey(k)
+	if seen[k] {
+		return nil, false
 	}
-	return strings.Join(steps, " > ")
+	seen[k] = true
+	var out []string
+	found := false
+	s.scan(k, func(w why) bool {
+		if w.next == nil {
+			out, found = []string{w.step}, true
+			return false
+		}
+		if rest, ok := s.explain(*w.next, seen); ok {
+			out, found = append([]string{w.step}, rest...), true
+			return false
+		}
+		return true
+	})
+	return out, found
 }
 
 // enter notes that k, a summary, a symbol, or a function summarized, is
@@ -241,28 +275,41 @@ func (s *summarizer) enter(k any) {
 	s.open = append(s.open, k)
 }
 
-// leave notes that k is worked out, and that what is being worked out
-// around it relies on what it relied on.
-func (s *summarizer) leave(k any) {
+// leave notes that k is worked out, and whether it allocates. Only what
+// allocates nothing relies on the lines that kept it so: every way through it
+// was walked, whatever came first, so the lines are the same however it was
+// reached. What it relied on, what is being worked out around it relies on.
+func (s *summarizer) leave(k any, allocates bool) {
 	s.open = s.open[:len(s.open)-1]
+	if allocates {
+		return
+	}
 	for l := range s.relied[k] {
 		s.rely(l)
 	}
 }
 
 // rely notes that what is being worked out relies on the allowlist line l.
-// A line noted for one open entry is noted for every entry opened before it,
-// so the first that has it ends the walk.
 func (s *summarizer) rely(l string) {
-	for _, k := range slices.Backward(s.open) {
-		if s.relied[k][l] {
-			return
-		}
-		if s.relied[k] == nil {
-			s.relied[k] = map[string]bool{}
-		}
-		s.relied[k][l] = true
+	if len(s.open) == 0 {
+		return
 	}
+	k := s.open[len(s.open)-1]
+	if s.relied[k] == nil {
+		s.relied[k] = map[string]bool{}
+	}
+	s.relied[k][l] = true
+}
+
+// query is answer, of a question about the summary being worked out, whose
+// lines count toward that summary when the answer is that nothing allocates.
+func (s *summarizer) query(answer func() bool) bool {
+	k := new(int)
+	s.enter(k)
+	v := answer()
+	s.leave(k, v)
+	delete(s.relied, k)
+	return v
 }
 
 // assume reports whether an allowlist line covers name, a function that
@@ -321,13 +368,13 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 		all = append(all, p.PkgPath)
 	})
 	type compiled struct {
-		escapes, notes, inlines, zeroCopies []escape
-		err                                 error
+		compilerReport
+		err error
 	}
 	done := make(chan compiled, 1)
 	go func() {
 		r, err := compilerEscapes(cfg, env, []string{"-gcflags=all=-m"})
-		done <- compiled{r.escapes, r.notes, r.inlines, r.zeroCopies, err}
+		done <- compiled{r, err}
 	}()
 	pkgs, err := packages.Load(&packages.Config{Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 		packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo,
@@ -366,7 +413,8 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 	c.reach(nil)
 
 	s := &summarizer{c: c, mc: mc, escapes: map[string][]escape{}, edges: map[*ssa.Function]map[ssa.CallInstruction][]*ssa.Function{},
-		assumed: assumed, relied: map[any]map[string]bool{}, linknames: linknames(pkgs), whys: map[sumKey]why{}}
+		assumed: assumed, relied: map[any]map[string]bool{}, linknames: linknames(pkgs),
+		judged: map[*ssa.Function]bool{}, workedOut: map[*ssa.Function]map[string]bool{}}
 	// A call returns the memory it is handed, appended to, when every
 	// return of the function it calls, shaped like append, is that, or when
 	// that function, handed reused memory, allocates nothing but to grow it.
@@ -377,7 +425,7 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 		return slices.ContainsFunc(symbolFuncs(sym), s.assume)
 	}
 	mc.enter = func(sym string) { s.enter("symbol: " + sym) }
-	mc.leave = func(sym string) { s.leave("symbol: " + sym) }
+	mc.leave = func(sym string, allocates bool) { s.leave("symbol: "+sym, allocates) }
 	for _, e := range comp.escapes {
 		s.escapes[e.file] = append(s.escapes[e.file], e)
 	}
@@ -391,23 +439,192 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 	}
 	s.inlined = c.positions(comp.inlines)
 	c.zeroCopies = c.positions(comp.zeroCopies)
+	c.bufferedLines = map[asmPos]bool{}
+	mc.code = newCodeReader()
+	defer mc.code.spill.close()
+	c.compiledCode = func(in *ssa.Convert, file string, from, to int, runtime string) bool {
+		top := topLevel(in.Parent())
+		if top.Pkg == nil {
+			return false
+		}
+		body := [2]int{from, to}
+		if syntax := top.Syntax(); syntax != nil {
+			body = [2]int{c.fset.Position(syntax.Pos()).Line, c.fset.Position(syntax.End()).Line}
+		}
+		ok := testHookCompiledCode != nil && testHookCompiledCode(in) ||
+			mc.withoutCopy(top.Pkg.Pkg.Path(), file, from, to, body, runtime)
+		s.judge(in.Parent())
+		return ok
+	}
 	s.inlinedEsc = c.positions(inlinedEscapes(comp.escapes))
 	byName := map[string]*ssa.Function{}
-	for fn := range ssautil.AllFunctions(prog) {
+	for _, fn := range c.allFunctions() {
 		byName[summaryName(fn)] = fn
 	}
 	out := map[string]summary{}
 	for _, n := range names {
 		s.enter(n)
 		sum := s.summary(pkgs, byName, n)
-		s.leave(n)
+		s.leave(n, false)
 		sum.Assumed = slices.Sorted(maps.Keys(s.relied[n]))
 		out[n] = sum
+	}
+	disagree, err := s.crossCheck()
+	if err != nil {
+		return nil, err
 	}
 	if mc.err != nil {
 		return nil, mc.err
 	}
+	if len(disagree) > 0 {
+		return nil, &CompiledCodeError{Calls: disagree}
+	}
 	return out, nil
+}
+
+// CompiledCodeError is a check of a dependency's code stopping because what it
+// read from the source and what the compiler produced disagree: code that was
+// found to allocate nothing calls a runtime function that allocates.
+type CompiledCodeError struct {
+	Calls []RuntimeCall
+}
+
+func (e *CompiledCodeError) Error() string {
+	var b strings.Builder
+	b.WriteString("noalloc can't trust its reading of these dependencies, whose compiled code calls an allocating function where it found no allocation:")
+	for _, c := range e.Calls {
+		fmt.Fprintf(&b, "\n  %s", c)
+	}
+	b.WriteString("\nPlease report this to noalloc's maintainers, with your Go version.")
+	return b.String()
+}
+
+// crossCheck holds what summaries found to the compiled code they did not read
+// by line: the runtime calls each function's own symbol makes. A function judged
+// by its compiled code gets one fixed question for each set of constants that
+// decides its blocks: with every block checked, no reused memory, and its own
+// escapes left out, does it allocate? If it does not, its code, on the lines
+// those constants leave and in what it inlines, should make no conversion, but
+// for what a stack buffer holds. If it also does not with its escapes counted,
+// that code should call nothing that allocates.
+func (s *summarizer) crossCheck() ([]RuntimeCall, error) {
+	type question struct {
+		fn     *ssa.Function
+		consts string
+		// lines holds each line of fn's blocks, and whether those constants
+		// run it.
+		lines map[int]bool
+		// onlyConversions is whether its escapes allocate, which leaves only
+		// conversions for the code to contradict.
+		onlyConversions bool
+	}
+	bySymbol := map[string][]*question{}
+	asked := 0
+	seen := map[*ssa.Function]map[string]bool{}
+	// Asking can judge more functions, which get their questions in turn.
+	for i := 0; i < len(s.judgedList); i++ {
+		fn := s.judgedList[i]
+		for _, consts := range append([]string{""}, slices.Sorted(maps.Keys(s.workedOut[fn]))...) {
+			if seen[fn][consts] {
+				continue
+			}
+			if seen[fn] == nil {
+				seen[fn] = map[string]bool{}
+			}
+			seen[fn][consts] = true
+			asked++
+			if s.allocatesUnlabeled(fn, consts, true) {
+				continue
+			}
+			q := &question{fn: fn, consts: consts, lines: s.linesRun(fn, consts), onlyConversions: s.allocatesUnlabeled(fn, consts, false)}
+			sym := symbolOf(fn)
+			bySymbol[sym] = append(bySymbol[sym], q)
+		}
+	}
+	if testHookSummariesChecked != nil {
+		testHookSummariesChecked(asked)
+	}
+	var out []RuntimeCall
+	found := map[RuntimeCall]bool{}
+	err := s.mc.code.spill.each(func(f []string) {
+		if len(f) != 4 || bufferedRuntime.MatchString(f[3]) {
+			return
+		}
+		sym := compiledSymbol(f[0])
+		if v := pointerWrapper.ReplaceAllString(sym, "$1$2."); len(bySymbol[sym]) == 0 && len(bySymbol[v]) > 0 {
+			sym = v
+		}
+		line, _ := strconv.Atoi(f[2])
+		for _, q := range bySymbol[sym] {
+			file := filepath.Base(s.c.fset.Position(q.fn.Pos()).Filename)
+			run, own := q.lines[line]
+			own = own && file == f[1]
+			switch {
+			case q.onlyConversions && !conversionCalls.MatchString(f[3]),
+				own && !run,
+				!own && q.consts != "",
+				s.c.bufferedLines[asmPos{f[1], line}] && (f[3] == "slicebytetostring" || strings.HasPrefix(f[3], "concatstring")):
+				continue
+			}
+			r := RuntimeCall{File: f[1], Line: line, Source: "", Func: f[0], Runtime: f[3]}
+			if !found[r] {
+				found[r] = true
+				out = append(out, r)
+			}
+		}
+	})
+	slices.SortFunc(out, func(a, b RuntimeCall) int {
+		return cmp.Or(strings.Compare(a.Func, b.Func), strings.Compare(a.File, b.File), a.Line-b.Line, strings.Compare(a.Runtime, b.Runtime))
+	})
+	return out, err
+}
+
+// allocatesUnlabeled is the fixed question of crossCheck. An answer that relies
+// on an allowlist line counts as allocating: the code can call what the line
+// labels.
+func (s *summarizer) allocatesUnlabeled(fn *ssa.Function, consts string, bare bool) bool {
+	k := new(int)
+	s.enter(k)
+	v := s.allocatesFrom(fn, 0, false, consts, bare)
+	relied := len(s.relied[k]) > 0
+	s.open = s.open[:len(s.open)-1]
+	delete(s.relied, k)
+	return v || relied
+}
+
+// linesRun maps each line of fn's blocks, and those a conversion in them spans,
+// to whether a block run with every failure checked and consts holding runs it.
+func (s *summarizer) linesRun(fn *ssa.Function, consts string) map[int]bool {
+	c := s.c
+	was, had := c.failing[fn]
+	c.failing[fn] = 0
+	ok := c.allowedBlocks(fn)
+	if had {
+		c.failing[fn] = was
+	} else {
+		delete(c.failing, fn)
+	}
+	if known := paramConsts(fn, consts); len(known) > 0 {
+		ok = reachableWith(fn, ok, known)
+	}
+	lines := map[int]bool{}
+	note := func(line int, run bool) { lines[line] = lines[line] || run }
+	for _, b := range fn.Blocks {
+		for _, in := range b.Instrs {
+			if !in.Pos().IsValid() {
+				continue
+			}
+			note(c.fset.Position(in.Pos()).Line, ok[b])
+			if conv, isConv := in.(*ssa.Convert); isConv {
+				if call, _ := c.callAt(conv.Pos()); call != nil {
+					for l := c.fset.Position(call.Lparen).Line; l <= c.fset.Position(call.Rparen).Line; l++ {
+						note(l, ok[b])
+					}
+				}
+			}
+		}
+	}
+	return lines
 }
 
 // summary works out the summary of n, a function as funcName has it or a
@@ -440,12 +657,12 @@ func (s *summarizer) summary(pkgs []*packages.Package, byName map[string]*ssa.Fu
 		sum.Shaped = appendSignature(fn.Signature)
 		sum.Returns = sum.Shaped && s.returnsAppended(fn)
 		for _, f := range failureContexts {
-			sum.Alloc[f] = s.allocates(fn, f, false)
-			sum.Appends[f] = sum.Shaped && !s.allocates(fn, f, true)
+			sum.Alloc[f] = s.query(func() bool { return s.allocates(fn, f, false) })
+			sum.Appends[f] = sum.Shaped && !s.query(func() bool { return s.allocates(fn, f, true) })
 			if sum.Alloc[f] {
 				sum.Why[f] = s.chain(sumKey{fn, f, false, "", false})
 			}
-			sum.Bare[f] = sum.Alloc[f] && s.allocatesWith(fn, f, false, "", true)
+			sum.Bare[f] = sum.Alloc[f] && s.query(func() bool { return s.allocatesWith(fn, f, false, "", true) })
 		}
 		return sum
 	}
@@ -475,9 +692,26 @@ func genericBase(name string) (string, bool) {
 // its type arguments, since each instance is code of its own.
 func summaryName(fn *ssa.Function) string {
 	if fn.Origin() != nil {
-		return fn.RelString(nil)
+		return canonicalTypes(fn.RelString(nil))
 	}
 	return funcName(fn)
+}
+
+var typeSynonym = regexp.MustCompile(`\b(rune|byte)\b|interface\{\}`)
+
+// canonicalTypes writes each type of name one way. Identical types can be
+// spelled two ways, and the program spells an instance as whichever of its
+// callers it builds first, in no fixed order.
+func canonicalTypes(name string) string {
+	return typeSynonym.ReplaceAllStringFunc(name, func(t string) string {
+		switch t {
+		case "rune":
+			return "int32"
+		case "byte":
+			return "uint8"
+		}
+		return "any"
+	})
 }
 
 // linknames maps each function pkgs declare with no body, as its package and
@@ -570,12 +804,19 @@ func (s *summarizer) methodSummary(pkgs []*packages.Package, iface, method strin
 	}
 	out.NoImpl = len(impls) == 0
 	for _, f := range failureContexts {
-		for _, fn := range impls {
-			if s.allocates(fn, f, false) {
-				out.Alloc[f] = true
-				out.Why[f] = s.chain(sumKey{fn, f, false, "", false})
-				break
+		var first *ssa.Function
+		s.query(func() bool {
+			for _, fn := range impls {
+				if s.allocates(fn, f, false) {
+					first = fn
+					return true
+				}
 			}
+			return false
+		})
+		if first != nil {
+			out.Alloc[f] = true
+			out.Why[f] = s.chain(sumKey{first, f, false, "", false})
 		}
 	}
 	return out
@@ -648,34 +889,54 @@ func (s *summarizer) allocatesWith(fn *ssa.Function, fails failures, app bool, c
 // allocatesFrom is allocatesWith of fn, a function outside the module, by
 // its code.
 func (s *summarizer) allocatesFrom(fn *ssa.Function, fails failures, app bool, consts string, bare bool) bool {
-	top := topLevel(fn)
-	if fn.Blocks == nil && fn.Origin() != nil && fn.Origin().Blocks != nil {
-		// An instance not built for its own type arguments, as one in a
-		// generic body is, runs its generic function's body.
-		fn = fn.Origin()
+	k := s.normalKey(sumKey{fn, fails, app, consts, bare})
+	if !s.readable(k.fn) {
+		sym := s.symbolOfCode(k.fn)
+		return sym == "" || s.mc.allocates(sym)
 	}
-	readable := fn.Blocks != nil && (wrapper(fn) || top.Pkg != nil && !runtimePackage(top.Pkg.Pkg.Path()))
-	if !readable {
-		sym := symbolOf(fn)
-		if fn.Blocks == nil && top.Pkg != nil {
-			if to, ok := s.linknames[top.Pkg.Pkg.Path()+"."+fn.Name()]; ok {
-				sym = to
-			}
-		}
-		k := sumKey{fn, fails, app, "", false}
-		if sym == "" {
-			return s.because(k, why{step: funcName(fn) + " has no code to read"})
-		}
-		if s.mc.allocates(sym) {
-			return s.because(k, why{step: "machine code of " + sym, nextSym: sym})
-		}
-		return false
+	if s.workedOut[k.fn] == nil {
+		s.workedOut[k.fn] = map[string]bool{}
 	}
-	app = app && appendSignature(fn.Signature)
-	k := sumKey{fn, fails, app, consts, bare && fn.Blocks != nil}
+	s.workedOut[k.fn][k.consts] = true
 	s.enter(k)
-	defer s.leave(k)
-	return s.memo.get(k, false, func() bool { return s.compute(k) })
+	v := s.memo.get(k, false, func() bool { return s.compute(k) })
+	s.leave(k, v)
+	return v
+}
+
+// normalKey is k as it is worked out: an instance not built for its own type
+// arguments, as one in a generic body is, runs its generic function's body;
+// code read compiled has nothing its arguments decide; and a function not
+// shaped like append has no memory to reuse.
+func (s *summarizer) normalKey(k sumKey) sumKey {
+	if k.fn.Blocks == nil && k.fn.Origin() != nil && k.fn.Origin().Blocks != nil {
+		k.fn = k.fn.Origin()
+	}
+	if !s.readable(k.fn) {
+		k.consts, k.bare = "", false
+		return k
+	}
+	k.app = k.app && appendSignature(k.fn.Signature)
+	k.bare = k.bare && k.fn.Blocks != nil
+	return k
+}
+
+// readable reports whether fn is judged from its source.
+func (s *summarizer) readable(fn *ssa.Function) bool {
+	top := topLevel(fn)
+	return fn.Blocks != nil && (wrapper(fn) || top.Pkg != nil && !runtimePackage(top.Pkg.Pkg.Path()))
+}
+
+// symbolOfCode names the compiled code fn runs: its own, or that of the symbol
+// a //go:linkname binds it to. It is "" when fn has none.
+func (s *summarizer) symbolOfCode(fn *ssa.Function) string {
+	top := topLevel(fn)
+	if fn.Blocks == nil && top.Pkg != nil {
+		if to, ok := s.linknames[top.Pkg.Pkg.Path()+"."+fn.Name()]; ok {
+			return to
+		}
+	}
+	return symbolOf(fn)
 }
 
 func topLevel(fn *ssa.Function) *ssa.Function {
@@ -689,6 +950,26 @@ func topLevel(fn *ssa.Function) *ssa.Function {
 }
 
 func (s *summarizer) compute(k sumKey) bool {
+	found := false
+	s.scan(k, func(why) bool {
+		found = true
+		return false
+	})
+	return found
+}
+
+// scan calls yield with each reason the summary k allocates, in the order of
+// the code, until yield returns false.
+func (s *summarizer) scan(k sumKey, yield func(why) bool) {
+	if !s.readable(k.fn) {
+		switch sym := s.symbolOfCode(k.fn); {
+		case sym == "":
+			yield(why{step: funcName(k.fn) + " has no code to read"})
+		case s.mc.allocates(sym):
+			yield(why{step: strings.Join(append([]string{"machine code of " + sym}, s.mc.chain(sym)...), " > ")})
+		}
+		return
+	}
 	fn, fails, app := k.fn, k.fails, k.app
 	c := s.c
 	at := func(in ssa.Instruction) string {
@@ -733,25 +1014,30 @@ func (s *summarizer) compute(k sumKey) bool {
 			call, isCall := in.(ssa.CallInstruction)
 			if !isCall {
 				if r := c.instrAllocs(in); len(r) > 0 {
-					return s.because(k, why{step: funcName(fn) + ": " + r[0] + " at " + at(in)})
+					yield(why{step: funcName(fn) + ": " + r[0] + " at " + at(in)})
+					return
 				}
 				continue
 			}
 			if _, isBuiltin := call.Common().Value.(*ssa.Builtin); isBuiltin {
-				if r := c.callAllocs(call); len(r) > 0 {
-					return s.because(k, why{step: funcName(fn) + ": " + r[0] + " at " + at(in)})
+				if r := c.callAllocs(call); len(r) > 0 && (testHookMissesBuiltin == nil || !testHookMissesBuiltin(in)) {
+					yield(why{step: funcName(fn) + ": " + r[0] + " at " + at(in)})
+					return
 				}
 				continue
 			}
 			if _, isGo := call.(*ssa.Go); isGo {
-				return s.because(k, why{step: funcName(fn) + ": go statement at " + at(in)})
+				yield(why{step: funcName(fn) + ": go statement at " + at(in)})
+				return
 			}
 			if d, isDefer := call.(*ssa.Defer); isDefer && inLoop(d.Block()) {
-				return s.because(k, why{step: funcName(fn) + ": defer in a loop at " + at(in)})
+				yield(why{step: funcName(fn) + ": defer in a loop at " + at(in)})
+				return
 			}
 			gs := edges[call]
 			if len(gs) == 0 {
-				return s.because(k, why{step: funcName(fn) + ": call with no known callee at " + at(in)})
+				yield(why{step: funcName(fn) + ": call with no known callee at " + at(in)})
+				return
 			}
 			for _, g := range gs {
 				if onceSetup(g) {
@@ -775,22 +1061,26 @@ func (s *summarizer) compute(k sumKey) bool {
 						continue
 					}
 					next := sumKey{g, y, true, consts, false}
-					return s.because(k, why{step: funcName(fn) + " calls " + funcName(g) + " at " + at(in), next: &next})
+					if !yield(why{step: funcName(fn) + " calls " + funcName(g) + " at " + at(in), next: &next}) {
+						return
+					}
+					continue
 				}
 				if s.allocatesWith(g, y, false, consts, false) && (!bare || s.allocatesWith(g, y, false, consts, true)) {
 					next := sumKey{g, y, false, consts, false}
-					return s.because(k, why{step: funcName(fn) + " calls " + funcName(g) + " at " + at(in), next: &next})
+					if !yield(why{step: funcName(fn) + " calls " + funcName(g) + " at " + at(in), next: &next}) {
+						return
+					}
 				}
 			}
 		}
 	}
 	if k.bare {
-		return false
+		return
 	}
 	if e, found := s.escapesIn(fn, ok); found {
-		return s.because(k, why{step: fmt.Sprintf("%s: escapes: %s at %s:%d", funcName(fn), e.msg, filepath.Base(e.file), e.line)})
+		yield(why{step: fmt.Sprintf("%s: escapes: %s at %s:%d", funcName(fn), e.msg, filepath.Base(e.file), e.line)})
 	}
-	return false
 }
 
 // constArgs writes which of g's bool parameters call passes a constant to,

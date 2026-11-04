@@ -58,8 +58,9 @@ long-lived struct. An append to it is only allowed after a comparison proves
 there's room. You can also mark a type's fields as reused memory with
 `-scratch pkg/path.Type`. A call to a function outside your module is
 allowed when that function's own code allocates nothing, which noalloc works
-out from its source, or from its compiled code when it's written in assembly
-or is part of the runtime. Packages you check from source with `-source`,
+out from its source, or from its compiled code when it's written in assembly,
+is part of the runtime, or converts between strings and slices, which only the
+compiled code shows copying or not. Packages you check from source with `-source`,
 which takes an import path prefix, are checked as part of your module
 instead. Check noalloc's own libraries that way:
 `-source github.com/theconsensuslabs/noalloc/bounded`, and the same for

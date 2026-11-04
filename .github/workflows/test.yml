@@ -77,6 +77,34 @@ jobs:
             exit 1
           fi
 
+  # The root package's tables record what the compiler does, which differs
+  # between architectures, so they run on arm64 as well as amd64.
+  test-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      GO_VERSION: "1.27.0"
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}"
+          git config --local http.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git fetch -q --depth 1 --no-tags origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Install Go
+        run: |
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: go test .
+
   # Each fuzz target, briefly, on every change; fuzz.yml fuzzes longer
   # nightly. A plain go test above already runs each target's seeds and the
   # inputs saved under testdata/fuzz.

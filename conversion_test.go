@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -69,9 +70,8 @@ var (
 
 // Each shape's outcomes hold one letter per conversion kind, in order: A
 // allocates and is a finding, C allocates nothing and is no finding, and - is a
-// shape the kind's type can't take. S allocates nothing and is no finding in the
-// module's own code, where Check reads the compiled code, but is a finding in a
-// dependency's, where it has only the source and the escape report.
+// shape the kind's type can't take. Each holds in the module's own code and in a
+// dependency's, where Check reads the compiled code alike.
 //
 // CONV is the conversion and COUNT a function taking its result that the
 // compiler won't inline.
@@ -104,9 +104,9 @@ var conversionShapes = []struct{ name, body, outcomes string }{
 	{"lookup variable twice", "v := CONV\nn += m[v] + m[v]", "ACACA--"},
 	{"lookup variable after a write", "v := CONV\nb[0] = 'q'\nn += m[v]", "ACACA--"},
 	{"lookup variable after a call", "v := CONV\nn += count(t)\nn += m[v]", "ACACA--"},
-	{"lookup variable in a later block", "v := CONV\nif len(t) > 0 {\nn += m[v]\n}", "SCACA--"},
-	{"lookup in a struct key", "n += structs[pair{CONV, t}]", "SCACA--"},
-	{"lookup in an array key", "n += arrays[[2]string{CONV, t}]", "SCACA--"},
+	{"lookup variable in a later block", "v := CONV\nif len(t) > 0 {\nn += m[v]\n}", "CCACA--"},
+	{"lookup in a struct key", "n += structs[pair{CONV, t}]", "CCACA--"},
+	{"lookup in an array key", "n += arrays[[2]string{CONV, t}]", "CCACA--"},
 
 	{"range", "for range CONV {\nn++\n}", "ACACACA"},
 	{"range with values", "for _, c := range CONV {\nn += int(c)\n}", "ACACACA"},
@@ -115,7 +115,7 @@ var conversionShapes = []struct{ name, body, outcomes string }{
 	{"variable index", "v := CONV\nn += int(v[0])", "ACACACA"},
 	{"variable passed", "v := CONV\nn += COUNT(v)", "ACACACA"},
 	{"passed", "n += COUNT(CONV)", "ACACACA"},
-	{"length", "n += len(CONV)", "SCACACS"},
+	{"length", "n += len(CONV)", "CCACACC"},
 	{"index", "n += int((CONV)[0])", "ACACACA"},
 	{"discarded", "_ = CONV", "ACACACA"},
 	{"variable written", "v := CONV\nv[0] = 'q'\nn += int(v[0])", "-----AA"},
@@ -125,8 +125,7 @@ var conversionShapes = []struct{ name, body, outcomes string }{
 // conversionBetween are statements between a string([]byte) held in a variable
 // and its one use as a map key, each with its outcome as a table letter. None
 // allocates alone. The compiler reads the bytes in place only when the statement
-// leaves memory and calls nothing, and a dependency's source can't show that for
-// every statement, so a dependency's finding can be an S.
+// leaves memory and calls nothing.
 var conversionBetween = append(conversionBetweenOperators(), []conversionBetweenRow{
 	{"nothing", "", "", "C"},
 	{"arithmetic", "n += len(t)", "", "C"},
@@ -137,12 +136,12 @@ var conversionBetween = append(conversionBetweenOperators(), []conversionBetween
 	{"another lookup", "n += m[t]", "", "A"},
 	{"receive", "<-closedChan", "", "A"},
 	{"range over a map", "for range m {\nn++\n}", "", "A"},
-	{"string comparison", "if t == u {\nn++\n}", "", "S"},
-	{"type assertion", "if _, ok := anyValue.(string); ok {\nn++\n}", "", "S"},
+	{"string comparison", "if t == u {\nn++\n}", "", stringEqualOutcome()},
+	{"type assertion", "if _, ok := anyValue.(string); ok {\nn++\n}", "", "C"},
 	{"boxing a constant", "anyValue = \"x\"", "", "A"},
 	{"call", "n += count(t)", "", "A"},
 	{"copy", "copy(scratchBytes[:], t)", "", "A"},
-	{"closure", "func() { n++ }()", "", "S"},
+	{"closure", "func() { n++ }()", "", "C"},
 	{"atomic load", "n += int(atomic.LoadInt64(&counter))", "", "A"},
 	{"make of a constant size", "_ = make([]byte, 8)", "", "A"},
 
@@ -156,19 +155,28 @@ var conversionBetween = append(conversionBetweenOperators(), []conversionBetween
 
 	{"equal ints", "eq := global == n", "if eq {\nn++\n}", "C"},
 	{"equal floats", "eq := globalFloat == globalFloat2", "if eq {\nn++\n}", "C"},
-	{"equal strings", "eq := t == u", "if eq {\nn++\n}", "S"},
+	{"equal strings", "eq := t == u", "if eq {\nn++\n}", stringEqualOutcome()},
 	{"equal interfaces", "eq := anyValue == anyValue2", "if eq {\nn++\n}", "A"},
-	{"equal structs", "eq := globalPair == globalPair2", "if eq {\nn++\n}", "S"},
-	{"equal arrays", "eq := scratchBytes == scratchBytes2", "if eq {\nn++\n}", "S"},
+	{"equal structs", "eq := globalPair == globalPair2", "if eq {\nn++\n}", stringEqualOutcome()},
+	{"equal arrays", "eq := scratchBytes == scratchBytes2", "if eq {\nn++\n}", "C"},
 	{"read of a large struct", "large := globalLarge\nn += large[1]", "", "A"},
 }...)
 
 type conversionBetweenRow struct{ name, stmt, after, outcome string }
 
+// stringEqualOutcome is the table letter for a comparison of strings between a
+// conversion and its lookup: the compiler reads the bytes in place across it on
+// arm64 and copies them on amd64.
+func stringEqualOutcome() string {
+	if runtime.GOARCH == "amd64" {
+		return "A"
+	}
+	return "C"
+}
+
 // conversionBetweenOperators is a row for each binary operator over each scalar
 // type, computed without a branch and used after the lookup. Complex division
-// is a runtime call. Other complex operators are S for sharing its operand type,
-// and integer division is S for being a runtime call on some architectures.
+// is a runtime call.
 func conversionBetweenOperators() []conversionBetweenRow {
 	var rows []conversionBetweenRow
 	for _, operands := range []struct {
@@ -190,9 +198,6 @@ func conversionBetweenOperators() []conversionBetweenRow {
 		}{{operands.sink, operands.ops}, {"sinkBool", compare}} {
 			for _, op := range sink.ops {
 				outcome := "C"
-				if operands.name == "complex" || operands.name != "float" && (op == "/" || op == "%") {
-					outcome = "S"
-				}
 				if operands.name == "complex" && op == "/" {
 					outcome = "A"
 				}
@@ -435,7 +440,7 @@ func TestConversionsPastTheirStackBufferAreFindings(t *testing.T) {
 				t.Errorf("%s: reason %q names neither a conversion nor a concatenation", at, r)
 			}
 		}
-		if got := foundInDependency[name]; (len(got) > 0) != (want == 'A' || want == 'S') {
+		if got := foundInDependency[name]; (len(got) > 0) != (want == 'A') {
 			t.Errorf("%s in a dependency: findings %q, table says %c", at, got, want)
 		}
 	}

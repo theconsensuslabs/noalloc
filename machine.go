@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -20,20 +23,20 @@ type machineCode struct {
 	// assumed reports whether a symbol that would allocate is labeled to
 	// allocate nothing, and enter and leave, when set, see each symbol as
 	// it is judged.
-	assumed      func(sym string) bool
-	enter, leave func(sym string)
-	env          []string
-	archives     map[string]string             // package path -> archive
-	err          error                         // the first archive that could not be read
-	text         map[string]map[string]textSym // package path -> symbol -> code
-	alloc        memo[string]
-	ret          memo[string]
+	assumed  func(sym string) bool
+	enter    func(sym string)
+	leave    func(sym string, allocates bool)
+	env      []string
+	archives map[string]string             // package path -> archive
+	err      error                         // the first archive that could not be read
+	text     map[string]map[string]textSym // package path -> symbol -> code
+	code     *codeReader                   // which lines of which packages hold code
+	names    map[string]string             // each symbol's one copy
+	alloc    memo[string]
+	ret      memo[string]
 	// noReturn holds the functions some call to is followed by no code to
 	// run, as the compiler compiles a call it knows never returns.
 	noReturn map[string]bool
-	// whys holds, for each symbol that allocates, the first step found
-	// toward what allocates, and the symbol to follow from it.
-	whys map[string][2]string
 }
 
 // textSym is what one function's code does that can allocate: the symbols
@@ -56,8 +59,8 @@ var testHookDisassemble func(archive string) error
 // newMachineCode reads code from archives, each package's from go list
 // -export: the archives the build being checked compiles and links.
 func newMachineCode(env []string, archives map[string]string) *machineCode {
-	return &machineCode{env: env, archives: archives, text: map[string]map[string]textSym{}, whys: map[string][2]string{},
-		noReturn: map[string]bool{}}
+	return &machineCode{env: env, archives: archives, text: map[string]map[string]textSym{}, noReturn: map[string]bool{},
+		names: map[string]string{}}
 }
 
 var (
@@ -85,42 +88,56 @@ func (m *machineCode) symbols(path string) map[string]textSym {
 	if !ok {
 		return t
 	}
-	out, err := m.disassemble(a)
-	if err != nil {
-		if m.err == nil {
-			m.err = err
-		}
-		return t
+	read := func(r io.Reader) error { return m.parseFrom(path, r, t) }
+	if err := m.disassemble(a, read); err != nil && m.err == nil {
+		m.err = err
 	}
-	m.parse(path, out, t)
+	if m.code != nil {
+		m.code.read[path] = true
+	}
 	return t
 }
 
-// parse reads out, objdump's output for package path, into t, each
+// parse reads out, objdump's output for package path, into t.
+func (m *machineCode) parse(path string, out []byte, t map[string]textSym) {
+	m.parseFrom(path, bytes.NewReader(out), t)
+}
+
+// parseFrom reads r, objdump's output for package path, into t, each
 // function's code by its symbol, and notes in m the functions the compiler
 // takes never to return.
-func (m *machineCode) parse(path string, out []byte, t map[string]textSym) {
+func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) error {
 	// An assembly file's own symbols, as cmpbody<1>, are named by the
 	// package they are in.
 	name := func(sym string) string {
 		sym = machineName(sym)
 		if strings.Contains(sym, "<") {
-			return path + "." + sym
+			sym = path + "." + sym
 		}
+		if n, ok := m.names[sym]; ok {
+			return n
+		}
+		sym = strings.Clone(sym)
+		m.names[sym] = sym
 		return sym
+	}
+	var code *codeScan
+	if m.code != nil && !m.code.read[path] {
+		code = &codeScan{reader: m.code, path: path}
 	}
 	var cur string
 	// called is the function the last call went to, until an instruction
 	// after it says whether the compiler takes it to return.
 	var called string
-	sc := bufio.NewScanner(bytes.NewReader(out))
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
 		l := sc.Text()
+		if code != nil {
+			code.line(l)
+		}
 		if h := textHeader.FindStringSubmatch(l); h != nil {
-			if called != "" {
-				m.noReturn[called] = true
-			}
+			m.noteNoReturn(path, called)
 			called = ""
 			cur = name(h[1])
 			if _, ok := t[cur]; !ok {
@@ -138,7 +155,8 @@ func (m *machineCode) parse(path string, out []byte, t map[string]textSym) {
 			switch op {
 			case "NOOP", "":
 			case "?", "UNDEF", "BRK", "INT3", "UD2":
-				m.noReturn[called], called = true, ""
+				m.noteNoReturn(path, called)
+				called = ""
 			default:
 				called = ""
 			}
@@ -179,6 +197,17 @@ func (m *machineCode) parse(path string, out []byte, t map[string]textSym) {
 			s.targets = append(s.targets, name(to))
 		}
 		t[cur] = s
+	}
+	return sc.Err()
+}
+
+// noteNoReturn notes that code of package path follows its call to called with
+// nothing to run. Only called's own package and the runtime count, whose
+// archives a judgment of called has always read, so the answer does not depend
+// on which other archives came before it.
+func (m *machineCode) noteNoReturn(path, called string) {
+	if called != "" && (path == "runtime" || symbolPackage(called) == path) {
+		m.noReturn[called] = true
 	}
 }
 
@@ -238,26 +267,26 @@ func branchTo(l string) (sym string, indirect bool) {
 	return "", true
 }
 
-// disassemble returns the code of every object in archive a: objdump reads
-// only an archive's compiled Go, and its assembly is in objects of its own.
-func (m *machineCode) disassemble(a string) ([]byte, error) {
+// disassemble hands read the code of each object in archive a, as it is
+// written: objdump reads only an archive's compiled Go, and its assembly is in
+// objects of its own.
+func (m *machineCode) disassemble(a string, read func(io.Reader) error) error {
 	if testHookDisassemble != nil {
 		if err := testHookDisassemble(a); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	tmp, err := os.MkdirTemp("", "noalloc-objects")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer os.RemoveAll(tmp)
 	list := exec.Command("go", "tool", "pack", "t", a)
 	list.Env = m.env
 	names, err := list.Output()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var out bytes.Buffer
 	for _, name := range strings.Fields(string(names)) {
 		if name == "__.PKGDEF" {
 			continue
@@ -265,17 +294,28 @@ func (m *machineCode) disassemble(a string) ([]byte, error) {
 		x := exec.Command("go", "tool", "pack", "x", a, name)
 		x.Dir, x.Env = tmp, m.env
 		if err := x.Run(); err != nil {
-			return nil, err
+			return err
 		}
 		d := exec.Command("go", "tool", "objdump", filepath.Join(tmp, name))
 		d.Env = m.env
-		b, err := d.Output()
+		out, err := d.StdoutPipe()
 		if err != nil {
-			return nil, fmt.Errorf("disassembling %s of %s: %v", name, a, err)
+			return err
 		}
-		out.Write(b)
+		if err := d.Start(); err != nil {
+			return err
+		}
+		readErr := read(out)
+		io.Copy(io.Discard, out)
+		if err := d.Wait(); err != nil {
+			return fmt.Errorf("disassembling %s of %s: %v", name, a, err)
+		}
+		if readErr != nil {
+			return fmt.Errorf("reading the code of %s of %s: %v", name, a, readErr)
+		}
+		os.Remove(filepath.Join(tmp, name))
 	}
-	return out.Bytes(), nil
+	return nil
 }
 
 // machineName is a symbol without the suffixes that name its ABI.
@@ -302,54 +342,72 @@ func symbolPackage(sym string) string {
 func (m *machineCode) allocates(sym string) bool {
 	if m.enter != nil {
 		m.enter(sym)
-		defer m.leave(sym)
 	}
-	return m.reaches(sym) && (m.assumed == nil || !m.assumed(sym))
+	v := m.reaches(sym)
+	if m.leave != nil {
+		m.leave(sym, v)
+	}
+	return v && (m.assumed == nil || !m.assumed(sym))
 }
 
 // reaches is allocates of sym by its code alone, with what it calls judged
 // by allocates.
 func (m *machineCode) reaches(sym string) bool {
 	return m.alloc.get(sym, false, func() bool {
-		pkg := symbolPackage(sym)
-		if pkg == "runtime" {
-			name := strings.TrimPrefix(sym, "runtime.")
-			if allocator.MatchString(name) {
-				return m.because(sym, sym+" is the runtime's allocator", "")
-			}
-			if callsC.MatchString(name) || growsStack.MatchString(name) || name == atomicWriteBarrier {
-				return false
-			}
-		}
-		s, ok := m.symbols(pkg)[sym]
-		if !ok {
-			// A function the runtime provides under another package's
-			// name, with go:linkname, is in the runtime's archive.
-			s, ok = m.symbols("runtime")[sym]
-		}
-		if !ok {
-			return m.because(sym, "no code for "+sym, "")
-		}
-		if !m.returns(sym) || m.noReturn[sym] {
+		found := false
+		m.scan(sym, func(string, string) bool {
+			found = true
 			return false
-		}
-		if s.indirect && !s.vdso {
-			return m.because(sym, sym+" calls through a register", "")
-		}
-		// Code that hands the runtime a closure to run is charged with the
-		// closures it names; one it names none of came from elsewhere.
-		if len(s.closures) == 0 && slices.ContainsFunc(s.targets, func(t string) bool {
-			return symbolPackage(t) == "runtime" && callsC.MatchString(strings.TrimPrefix(t, "runtime.")) && !strings.HasPrefix(t, "runtime.asmcgocall")
-		}) {
-			return m.because(sym, sym+" hands the runtime a closure it does not name", "")
-		}
-		for _, t := range s.targets {
-			if t != sym && m.allocates(t) {
-				return m.because(sym, sym+" calls "+t, t)
-			}
-		}
-		return false
+		})
+		return found
 	})
+}
+
+// scan calls yield with each reason the code of sym allocates, in the order of
+// that code, and the symbol to follow from it, until yield returns false.
+func (m *machineCode) scan(sym string, yield func(step, next string) bool) {
+	pkg := symbolPackage(sym)
+	if pkg == "runtime" {
+		name := strings.TrimPrefix(sym, "runtime.")
+		if allocator.MatchString(name) {
+			yield(sym+" is the runtime's allocator", "")
+			return
+		}
+		if callsC.MatchString(name) || growsStack.MatchString(name) || name == atomicWriteBarrier {
+			return
+		}
+	}
+	runtime := m.symbols("runtime")
+	s, ok := m.symbols(pkg)[sym]
+	if !ok {
+		// A function the runtime provides under another package's
+		// name, with go:linkname, is in the runtime's archive.
+		s, ok = runtime[sym]
+	}
+	if !ok {
+		yield("no code for "+sym, "")
+		return
+	}
+	if !m.returns(sym) || m.noReturn[sym] {
+		return
+	}
+	if s.indirect && !s.vdso {
+		yield(sym+" calls through a register", "")
+		return
+	}
+	// Code that hands the runtime a closure to run is charged with the
+	// closures it names; one it names none of came from elsewhere.
+	if len(s.closures) == 0 && slices.ContainsFunc(s.targets, func(t string) bool {
+		return symbolPackage(t) == "runtime" && callsC.MatchString(strings.TrimPrefix(t, "runtime.")) && !strings.HasPrefix(t, "runtime.asmcgocall")
+	}) {
+		yield(sym+" hands the runtime a closure it does not name", "")
+		return
+	}
+	for _, t := range s.targets {
+		if t != sym && m.allocates(t) && !yield(sym+" calls "+t, t) {
+			return
+		}
+	}
 }
 
 // callsC are the runtime functions that call through a register what they
@@ -366,32 +424,254 @@ var growsStack = regexp.MustCompile(`^morestack(_noctxt)?$`)
 // no memory from the heap for the caller.
 const atomicWriteBarrier = "atomicwb"
 
-// because notes why sym allocates, and the symbol to follow, and reports
-// that it does.
-func (m *machineCode) because(sym, step, next string) bool {
-	if _, ok := m.whys[sym]; !ok {
-		m.whys[sym] = [2]string{step, next}
-	}
-	return true
+// chain is why sym allocates, from sym to the allocation: the first way in
+// the order of the code, which does not depend on what was judged before it.
+func (m *machineCode) chain(sym string) []string {
+	steps, _ := m.explain(sym, map[string]bool{})
+	return steps[:min(len(steps), machineChainSteps)]
 }
 
-// chain is why sym allocates, from sym to the allocation.
-func (m *machineCode) chain(sym string) []string {
-	var steps []string
-	for range 32 {
-		w, ok := m.whys[sym]
-		if !ok {
-			break
-		}
-		steps = append(steps, w[0])
-		if w[1] == "" {
-			break
-		}
-		sym = w[1]
+// machineChainSteps bounds how many steps a chain is written with.
+const machineChainSteps = 32
+
+// explain is the steps from sym to an allocation that pass through no symbol
+// in seen, and whether there are any.
+func (m *machineCode) explain(sym string, seen map[string]bool) ([]string, bool) {
+	if seen[sym] {
+		return nil, false
 	}
-	return steps
+	seen[sym] = true
+	var out []string
+	found := false
+	m.scan(sym, func(step, next string) bool {
+		if next == "" {
+			out, found = []string{step}, true
+			return false
+		}
+		if rest, ok := m.explain(next, seen); ok {
+			out, found = append([]string{step}, rest...), true
+			return false
+		}
+		return true
+	})
+	return out, found
 }
 
 // allocator is the runtime's heap allocator, which is what allocating
 // means: every other allocation reaches it.
 var allocator = regexp.MustCompile(`^mallocgc`)
+
+// codeIndexWords sizes codeIndex. At a million lines of code one lookup in about
+// 75,000 answers yes wrongly.
+const codeIndexWords = 1 << 20
+
+// codeIndex is a set of a fixed size: a line it holds it always says it holds,
+// and one it does not it can, rarely, say it does. A wrong yes to "does this line
+// call the runtime" costs a finding too many.
+type codeIndex []uint64
+
+func (x codeIndex) probe(key string, visit func(word int, bit uint64) bool) bool {
+	f := fnv.New64a()
+	f.Write([]byte(key))
+	h := f.Sum64()
+	h1, h2 := h&0xffffffff, h>>32|1
+	for i := range uint64(4) {
+		at := h1 + i*h2
+		if !visit(int((at>>6)%uint64(len(x))), 1<<(at&63)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (x codeIndex) add(key string) {
+	x.probe(key, func(word int, bit uint64) bool {
+		x[word] |= bit
+		return true
+	})
+}
+
+func (x codeIndex) has(key string) bool {
+	return x.probe(key, func(word int, bit uint64) bool { return x[word]&bit != 0 })
+}
+
+// codeReader reads which lines of each package's compiled code hold code, and
+// which call a runtime function that makes a conversion. However much code it
+// reads it holds a fixed amount: the index, and a buffer on its way to a file of
+// those calls, which is read back once.
+type codeReader struct {
+	index codeIndex
+	read  map[string]bool
+	spill *spillFile
+}
+
+func newCodeReader() *codeReader {
+	return &codeReader{index: make(codeIndex, codeIndexWords), read: map[string]bool{}, spill: &spillFile{}}
+}
+
+// codeScan is a codeReader's place in one package's code.
+type codeScan struct {
+	reader *codeReader
+	path   string
+	sym    string
+}
+
+// conversionCalls are the runtime functions that make a conversion or a
+// concatenation.
+var conversionCalls = regexp.MustCompile(`^(slicebytetostring|slicerunetostring|stringtoslicebyte|stringtoslicerune|intstring|concatstring.*|concatbyte.*)$`)
+
+var runtimeCallee = regexp.MustCompile(`R_CALL[A-Z0-9]*:runtime\.([A-Za-z0-9_]+)`)
+
+// testHookCodeCall, when set, sees each conversion's call as it enters the
+// index: it says the line to index it at, or none.
+var testHookCodeCall func(sym, file string, line int, runtime string) (int, bool)
+
+// line reads l, a line of objdump's output.
+func (s *codeScan) line(l string) {
+	if rest, ok := strings.CutPrefix(l, "TEXT "); ok {
+		s.sym, _, _ = strings.Cut(rest, "(SB)")
+		s.sym = machineName(s.sym)
+		return
+	}
+	pos, instr, ok := strings.Cut(strings.TrimLeft(l, " "), "\t")
+	if !ok || s.sym == "" {
+		return
+	}
+	file, lineText, ok := strings.Cut(pos, ":")
+	if !ok {
+		return
+	}
+	s.reader.index.add(s.path + "\x00" + pos)
+	if !strings.Contains(instr, "runtime.") {
+		return
+	}
+	m := runtimeCallee.FindStringSubmatch(instr)
+	if m == nil || !allocatingRuntime.MatchString(m[1]) {
+		return
+	}
+	line, err := strconv.Atoi(lineText)
+	if err != nil {
+		return
+	}
+	s.reader.spill.write(s.sym, file, lineText, m[1])
+	if !conversionCalls.MatchString(m[1]) {
+		return
+	}
+	if testHookCodeCall != nil {
+		if line, ok = testHookCodeCall(s.sym, file, line, m[1]); !ok {
+			return
+		}
+	}
+	s.reader.index.add(callKey(s.path, file, line, m[1]))
+}
+
+func callKey(path, file string, line int, runtime string) string {
+	return lineKey(path, file, line) + "\x00" + runtime
+}
+
+func lineKey(path, file string, line int) string {
+	return path + "\x00" + file + ":" + strconv.Itoa(line)
+}
+
+// spillFile holds records of tab-separated fields on disk, past a fixed buffer,
+// until they are read back.
+type spillFile struct {
+	file *os.File
+	out  *bufio.Writer
+	err  error
+}
+
+// write adds a record.
+func (f *spillFile) write(fields ...string) {
+	if f.err != nil {
+		return
+	}
+	if f.file == nil {
+		if f.file, f.err = os.CreateTemp("", "noalloc-spill"); f.err != nil {
+			return
+		}
+		f.out = bufio.NewWriterSize(f.file, 64<<10)
+	}
+	for i, s := range fields {
+		if i > 0 {
+			f.out.WriteByte('\t')
+		}
+		f.out.WriteString(s)
+	}
+	_, f.err = f.out.WriteString("\n")
+}
+
+// each calls yield with each record written so far, whose fields are valid until
+// it returns.
+func (f *spillFile) each(yield func(fields []string)) error {
+	if f.err != nil || f.file == nil {
+		return f.err
+	}
+	if err := f.out.Flush(); err != nil {
+		return err
+	}
+	if _, err := f.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	defer f.file.Seek(0, io.SeekEnd)
+	sc := bufio.NewScanner(f.file)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		yield(strings.Split(sc.Text(), "\t"))
+	}
+	return sc.Err()
+}
+
+// close removes the file.
+func (f *spillFile) close() {
+	if f.file != nil {
+		f.file.Close()
+		os.Remove(f.file.Name())
+		f.file = nil
+	}
+}
+
+// lines has the code reader read the archive of package path, when nothing
+// has yet.
+func (m *machineCode) lines(path string) {
+	if m.code.read[path] {
+		return
+	}
+	m.code.read[path] = true
+	a, ok := m.archives[path]
+	if !ok {
+		return
+	}
+	read := func(r io.Reader) error {
+		code := &codeScan{reader: m.code, path: path}
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 1<<20), 1<<20)
+		for sc.Scan() {
+			code.line(sc.Text())
+		}
+		return sc.Err()
+	}
+	if err := m.disassemble(a, read); err != nil && m.err == nil {
+		m.err = err
+	}
+}
+
+// withoutCopy reports whether the code of package path compiles the function on
+// lines body of file, and no call to runtime is on lines from to to: the
+// conversion written there is compiled without it. Code the package did not
+// compile, as a generic body's is when only another package instantiates it, says
+// nothing.
+func (m *machineCode) withoutCopy(path, file string, from, to int, body [2]int, runtime string) bool {
+	m.lines(path)
+	for line := from; line <= to; line++ {
+		if m.code.index.has(callKey(path, file, line, runtime)) {
+			return false
+		}
+	}
+	for line := body[0]; line <= body[1]; line++ {
+		if m.code.index.has(lineKey(path, file, line)) {
+			return true
+		}
+	}
+	return false
+}
