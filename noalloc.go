@@ -2763,15 +2763,21 @@ func sameAddr(a, b ssa.Value) bool {
 func (c *checker) check(fn *ssa.Function, add func(*ssa.Function, site)) {
 	ok := c.blocks[fn]
 	for _, b := range fn.Blocks {
-		if !ok[b] {
-			continue
-		}
 		for _, in := range b.Instrs {
 			pos := in.Pos()
 			if call, isCall := in.(ssa.CallInstruction); isCall && !pos.IsValid() {
 				pos = call.Common().Pos()
 			}
 			if !pos.IsValid() {
+				continue
+			}
+			// An exempt line off the normal path (first-use setup or a
+			// failure) is reached, and the exemption covers nothing there,
+			// since such a block allocates as it likes.
+			if !ok[b] {
+				if i, exempt := c.exemptionIndex(pos); exempt {
+					c.exemptions[i].Reached = true
+				}
 				continue
 			}
 			if i, ok := c.exemptionIndex(pos); ok {
@@ -4012,10 +4018,10 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 		if in == nil || len(in.fns) == 0 {
 			continue
 		}
-		if i, ok := c.exemptionAt[e.file][e.line]; ok && c.exempt[e.file][e.line] {
-			c.exemptions[i].Reached = true
-			c.addCover(i, in.fns[0], e.site())
-			continue
+		exemption, exempt := c.exemptionAt[e.file][e.line]
+		exempt = exempt && c.exempt[e.file][e.line]
+		if exempt {
+			c.exemptions[exemption].Reached = true
 		}
 		// The escape is on the normal path when a function that runs its line
 		// runs it there. A wrapper sharing the syntax runs none of the body's
@@ -4051,6 +4057,10 @@ func (c *checker) matchEscapes(escapes, notes []escape, add func(*ssa.Function, 
 		}
 		if fn == nil {
 			fn = in.fns[0]
+		}
+		if exempt {
+			c.addCover(exemption, fn, e.site())
+			continue
 		}
 		add(fn, e.site())
 	}
@@ -4382,7 +4392,7 @@ var diagLine = regexp.MustCompile(`^(.+\.go):(\d+):(\d+): (.*)$`)
 // assembly for the module's packages, and returns the heap allocations it
 // reports and the runtime calls their compiled code makes.
 func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport, error) {
-	var escapes, notes, inlines, zeroCopies []escape
+	var escapes []escape
 	asm := &asmReader{}
 	seen := map[escape]bool{}
 	var overlay []string
@@ -4405,6 +4415,14 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 		return compilerReport{}, err
 	}
 	paths := map[string]string{}
+	rr := &reportReader{asm: asm, file: func(reported string) string {
+		file, ok := paths[reported]
+		if !ok {
+			file = reportedFile(reported, cfg.Dir, append(strings.Fields(string(roots)), cfg.Dir, cfg.Root))
+			paths[reported] = file
+		}
+		return file
+	}}
 	const flags = "-m -S"
 	for _, group := range patternGroups(cfg.Patterns) {
 		args := append([]string{"build"}, overlay...)
@@ -4433,62 +4451,18 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 			pw.Close()
 			waited <- err
 		}()
-		var last []string
-		// The compiler reports an inlined body's escapes at the call it was
-		// inlined into; the body's own compile reports them at their lines.
-		// It reports each once for each time it inlines the call, once in
-		// each shape a generic caller compiles to.
-		inlined := map[escape]int{}
-		var found []escape
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 1<<20), 1<<20)
-		for sc.Scan() {
-			text := sc.Text()
-			if last = append(last, text); len(last) > 40 {
-				last = last[1:]
-			}
-			asm.line(text)
-			m := diagLine.FindStringSubmatch(text)
-			if m == nil {
-				continue
-			}
-			file, ok := paths[m[1]]
-			if !ok {
-				file = reportedFile(m[1], cfg.Dir, append(strings.Fields(string(roots)), cfg.Dir, cfg.Root))
-				paths[m[1]] = file
-			}
-			line, _ := strconv.Atoi(m[2])
-			col, _ := strconv.Atoi(m[3])
-			at, msg := escape{file: file, line: line, col: col}, m[4]
-			if !strings.HasPrefix(msg, "inlining call to ") && !strings.HasPrefix(msg, "can inline ") {
-				notes = append(notes, at)
-			}
-			switch {
-			case strings.HasPrefix(msg, "inlining call to "):
-				if inlined[at] == 0 {
-					inlines = append(inlines, at)
-				}
-				inlined[at]++
-			case msg == "zero-copy string->[]byte conversion":
-				zeroCopies = append(zeroCopies, at)
-			case msg == "append escapes to heap":
-				// A growing append is the append rule's, which knows the Scratch.
-			case strings.HasPrefix(msg, "moved to heap: "), strings.HasSuffix(msg, " escapes to heap"):
-				at.msg = foldShapes(msg)
-				found = append(found, at)
-			}
-		}
-		scanErr := sc.Err()
+		rr.inlined, rr.found, rr.last.n = map[escape]int{}, nil, 0
+		scanErr := rr.read(pr)
 		io.Copy(io.Discard, pr)
 		if err := <-waited; err != nil {
-			return compilerReport{}, fmt.Errorf("go %s: %v\n%s", strings.Join(args, " "), err, tail(strings.Join(last, "\n"), 2000))
+			return compilerReport{}, fmt.Errorf("go %s: %v\n%s", strings.Join(args, " "), err, tail(rr.last.String(), 2000))
 		}
 		if scanErr != nil {
 			return compilerReport{}, scanErr
 		}
 		reports := map[escape]int{}
-		for _, e := range found {
-			n := inlined[escape{file: e.file, line: e.line, col: e.col}]
+		for _, e := range rr.found {
+			n := rr.inlined[escape{file: e.file, line: e.line, col: e.col}]
 			e.inlined = n > 0
 			if e.inlined {
 				// Of the n reports of each escape in an inlined body, the
@@ -4502,7 +4476,93 @@ func compilerEscapes(cfg Config, env []string, gcflags []string) (compilerReport
 			}
 		}
 	}
-	return compilerReport{escapes, notes, inlines, zeroCopies, asm}, nil
+	return compilerReport{escapes, rr.notes, rr.inlines, rr.zeroCopies, asm}, nil
+}
+
+// reportReader reads go build's output with -m and -S: the compiler's
+// diagnostics, which start at the left margin, and its assembly, which is
+// indented and goes to asm. It holds a fixed amount per line read, keeping
+// only what it finds.
+type reportReader struct {
+	asm *asmReader
+	// file names the file a diagnostic gives as reported.
+	file                       func(reported string) string
+	notes, inlines, zeroCopies []escape
+	// The compiler reports an inlined body's escapes at the call it was
+	// inlined into; the body's own compile reports them at their lines. It
+	// reports each once for each time it inlines the call, once in each
+	// shape a generic caller compiles to. inlined counts the inlines at each
+	// call, and found holds the escapes, of one build.
+	inlined map[escape]int
+	found   []escape
+	// last is the end of the output, for an error to show.
+	last lastLines
+}
+
+func (r *reportReader) read(in io.Reader) error {
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		r.line(sc.Bytes())
+	}
+	return sc.Err()
+}
+
+func (r *reportReader) line(b []byte) {
+	r.last.add(b)
+	r.asm.line(b)
+	if len(b) == 0 || b[0] == '\t' || b[0] == ' ' {
+		return
+	}
+	m := diagLine.FindStringSubmatch(string(b))
+	if m == nil {
+		return
+	}
+	line, _ := strconv.Atoi(m[2])
+	col, _ := strconv.Atoi(m[3])
+	at, msg := escape{file: r.file(m[1]), line: line, col: col}, m[4]
+	if !strings.HasPrefix(msg, "inlining call to ") && !strings.HasPrefix(msg, "can inline ") {
+		r.notes = append(r.notes, at)
+	}
+	switch {
+	case strings.HasPrefix(msg, "inlining call to "):
+		if r.inlined[at] == 0 {
+			r.inlines = append(r.inlines, at)
+		}
+		r.inlined[at]++
+	case msg == "zero-copy string->[]byte conversion":
+		r.zeroCopies = append(r.zeroCopies, at)
+	case msg == "append escapes to heap":
+		// A growing append is the append rule's, which knows the Scratch.
+	case strings.HasPrefix(msg, "moved to heap: "), strings.HasSuffix(msg, " escapes to heap"):
+		at.msg = foldShapes(msg)
+		r.found = append(r.found, at)
+	}
+}
+
+// lastLines holds copies of the last 40 lines added, reusing their memory.
+type lastLines struct {
+	lines [40][]byte
+	n     int
+}
+
+func (l *lastLines) add(b []byte) {
+	i := l.n % len(l.lines)
+	l.lines[i] = append(l.lines[i][:0], b...)
+	l.n++
+}
+
+// String is the lines held, oldest first, each but the last ending in a newline.
+func (l *lastLines) String() string {
+	var b strings.Builder
+	start := max(0, l.n-len(l.lines))
+	for i := start; i < l.n; i++ {
+		if i > start {
+			b.WriteByte('\n')
+		}
+		b.Write(l.lines[i%len(l.lines)])
+	}
+	return b.String()
 }
 
 // patternGroups splits patterns into what one go build takes: each package

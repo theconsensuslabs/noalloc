@@ -109,7 +109,7 @@ func (c *checker) loadSummaries(env []string) error {
 	if err != nil {
 		return err
 	}
-	cache, err := openSummaryCache(c.cfg, buildKey(c.cfg, pkgs, c.allow.assumed))
+	cache, err := openSummaryCache(c.cfg, buildKey(c.cfg, pkgs, c.allow.assumed), moduleKey(c.cfg, pkgs))
 	if err != nil {
 		return err
 	}
@@ -160,6 +160,7 @@ func (c *checker) machineSummaries(env []string, fns []*ssa.Function, archives m
 		return nil
 	}
 	mc := newMachineCode(env, archives)
+	mc.cache = machineCacheDir(c.cfg)
 	mc.assumed = func(sym string) bool {
 		return slices.ContainsFunc(symbolFuncs(sym), c.overridden)
 	}
@@ -390,6 +391,7 @@ func summarize(cfg Config, env []string, names []string, archives map[string]str
 	}
 	prog.Build()
 	mc := newMachineCode(env, archives)
+	mc.cache = machineCacheDir(cfg)
 	comp := <-done
 	if comp.err != nil {
 		return nil, comp.err
@@ -1265,9 +1267,9 @@ func (s *summarizer) escapesIn(fn *ssa.Function, ok map[*ssa.BasicBlock]bool) (e
 	return escape{}, false
 }
 
-// summaryCache holds summaries on disk, keyed by buildKey, so that a check
-// of the same build after the first reads them rather than working them out
-// again.
+// summaryCache holds summaries on disk, in a file named by buildKey that
+// holds the summaries of one moduleKey, so that a check of the same build
+// after the first reads them rather than working them out again.
 type summaryCache struct {
 	path    string
 	file    summaryFile
@@ -1275,6 +1277,8 @@ type summaryCache struct {
 }
 
 type summaryFile struct {
+	// Module is the moduleKey the summaries were worked out under.
+	Module    string
 	Summaries map[string]summary
 }
 
@@ -1282,24 +1286,20 @@ type summaryFile struct {
 // directory keeps its summaries. Only tests set it.
 var testSummaryCache string
 
-func openSummaryCache(cfg Config, key string) (*summaryCache, error) {
-	dir := cfg.SummaryCache
-	if dir == "" {
-		dir = testSummaryCache
-	}
-	if dir == "" {
-		base, err := os.UserCacheDir()
-		if err != nil {
-			return nil, err
-		}
-		dir = filepath.Join(base, "noalloc")
+// openSummaryCache opens the cache file named by key. One holding summaries
+// worked out under another module key opens empty, and the next save replaces
+// it, so the directory keeps one file per key.
+func openSummaryCache(cfg Config, key, module string) (*summaryCache, error) {
+	dir, err := cacheDir(cfg)
+	if err != nil {
+		return nil, err
 	}
 	c := &summaryCache{path: filepath.Join(dir, "summaries-"+key[:24]+".json")}
 	if b, err := os.ReadFile(c.path); err == nil {
 		json.Unmarshal(b, &c.file)
 	}
-	if c.file.Summaries == nil {
-		c.file = summaryFile{Summaries: map[string]summary{}}
+	if c.file.Summaries == nil || c.file.Module != module {
+		c.file = summaryFile{Module: module, Summaries: map[string]summary{}}
 	}
 	return c, nil
 }

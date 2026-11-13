@@ -3,9 +3,12 @@ package noalloc
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // machineCode answers what a function allocates from its compiled code: the
@@ -28,6 +33,8 @@ type machineCode struct {
 	leave    func(sym string, allocates bool)
 	env      []string
 	archives map[string]string             // package path -> archive
+	cache    string                        // the directory of archiveCache, or "" for none
+	pruned   bool                          // whether a write to cache has pruned it
 	err      error                         // the first archive that could not be read
 	text     map[string]map[string]textSym // package path -> symbol -> code
 	code     *codeReader                   // which lines of which packages hold code
@@ -77,36 +84,93 @@ var (
 	relative = regexp.MustCompile(`^-?\d+\(PC\)$|^0x[0-9a-f]+$`)
 )
 
-// symbols disassembles the archive of package path.
+// symbols is the functions of package path's archive.
 func (m *machineCode) symbols(path string) map[string]textSym {
-	if t, ok := m.text[path]; ok {
-		return t
-	}
-	t := map[string]textSym{}
-	m.text[path] = t
-	a, ok := m.archives[path]
-	if !ok {
-		return t
-	}
-	read := func(r io.Reader) error { return m.parseFrom(path, r, t) }
-	if err := m.disassemble(a, read); err != nil && m.err == nil {
-		m.err = err
-	}
-	if m.code != nil {
+	m.load(path)
+	return m.text[path]
+}
+
+// load reads the archive of package path once: its functions into m.text, and
+// its lines into m's code reader when it has one that has not read them.
+func (m *machineCode) load(path string) {
+	t, haveText := m.text[path]
+	var code *codeReader
+	if m.code != nil && !m.code.read[path] {
+		code = m.code
 		m.code.read[path] = true
 	}
-	return t
+	if haveText && code == nil {
+		return
+	}
+	if !haveText {
+		t = map[string]textSym{}
+		m.text[path] = t
+	}
+	a, ok := m.archives[path]
+	if !ok {
+		return
+	}
+	if haveText {
+		// Its functions are read already; a disassembly reads them again
+		// into a map of its own.
+		t = nil
+	}
+	if err := m.read(path, a, t, code); err != nil && m.err == nil {
+		m.err = err
+	}
+}
+
+// read reads archive a of package path: its functions into t, unless t is nil,
+// and its lines into code, unless code is nil. A reading the archive cache holds
+// is replayed; any other is disassembled, and saved to the cache.
+func (m *machineCode) read(path, a string, t map[string]textSym, code *codeReader) error {
+	c := m.archiveCache(path, a)
+	if c.file != "" {
+		if c.replay(path, t, code) {
+			return nil
+		}
+		if t != nil {
+			clear(t)
+		}
+	}
+	w := c.create()
+	parsed := t
+	if parsed == nil {
+		parsed = map[string]textSym{}
+	}
+	err := m.disassemble(a, func(r io.Reader) error { return m.parseFrom(path, r, parsed, code, w) })
+	if err != nil {
+		w.abort()
+		return err
+	}
+	w.commit(parsed)
+	return nil
 }
 
 // parse reads out, objdump's output for package path, into t.
 func (m *machineCode) parse(path string, out []byte, t map[string]textSym) {
-	m.parseFrom(path, bytes.NewReader(out), t)
+	var code *codeReader
+	if m.code != nil && !m.code.read[path] {
+		code = m.code
+	}
+	m.parseFrom(path, bytes.NewReader(out), t, code, nil)
+}
+
+// intern is sym's one copy.
+func (m *machineCode) intern(sym string) string {
+	if n, ok := m.names[sym]; ok {
+		return n
+	}
+	sym = strings.Clone(sym)
+	m.names[sym] = sym
+	return sym
 }
 
 // parseFrom reads r, objdump's output for package path, into t, each
 // function's code by its symbol, and notes in m the functions the compiler
-// takes never to return.
-func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) error {
+// takes never to return. Its lines go to code, and what it finds to w, when
+// they are not nil.
+func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym, code *codeReader, w *archiveWriter) error {
 	// An assembly file's own symbols, as cmpbody<1>, are named by the
 	// package they are in.
 	name := func(sym string) string {
@@ -114,16 +178,11 @@ func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) 
 		if strings.Contains(sym, "<") {
 			sym = path + "." + sym
 		}
-		if n, ok := m.names[sym]; ok {
-			return n
-		}
-		sym = strings.Clone(sym)
-		m.names[sym] = sym
-		return sym
+		return m.intern(sym)
 	}
-	var code *codeScan
-	if m.code != nil && !m.code.read[path] {
-		code = &codeScan{reader: m.code, path: path}
+	var scan *codeScan
+	if code != nil || w != nil {
+		scan = &codeScan{reader: code, path: path, out: w}
 	}
 	var cur string
 	// called is the function the last call went to, until an instruction
@@ -133,11 +192,11 @@ func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) 
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
 		l := sc.Text()
-		if code != nil {
-			code.line(l)
+		if scan != nil {
+			scan.line(l)
 		}
 		if h := textHeader.FindStringSubmatch(l); h != nil {
-			m.noteNoReturn(path, called)
+			m.noteNoReturn(path, called, w)
 			called = ""
 			cur = name(h[1])
 			if _, ok := t[cur]; !ok {
@@ -155,7 +214,7 @@ func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) 
 			switch op {
 			case "NOOP", "":
 			case "?", "UNDEF", "BRK", "INT3", "UD2":
-				m.noteNoReturn(path, called)
+				m.noteNoReturn(path, called, w)
 				called = ""
 			default:
 				called = ""
@@ -204,10 +263,11 @@ func (m *machineCode) parseFrom(path string, r io.Reader, t map[string]textSym) 
 // noteNoReturn notes that code of package path follows its call to called with
 // nothing to run. Only called's own package and the runtime count, whose
 // archives a judgment of called has always read, so the answer does not depend
-// on which other archives came before it.
-func (m *machineCode) noteNoReturn(path, called string) {
+// on which other archives came before it. w, when not nil, records it.
+func (m *machineCode) noteNoReturn(path, called string, w *archiveWriter) {
 	if called != "" && (path == "runtime" || symbolPackage(called) == path) {
 		m.noReturn[called] = true
+		w.record('N', called)
 	}
 }
 
@@ -281,8 +341,7 @@ func (m *machineCode) disassemble(a string, read func(io.Reader) error) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	list := exec.Command("go", "tool", "pack", "t", a)
-	list.Env = m.env
+	list := toolCommand(m.env, "pack", "t", a)
 	names, err := list.Output()
 	if err != nil {
 		return err
@@ -291,13 +350,12 @@ func (m *machineCode) disassemble(a string, read func(io.Reader) error) error {
 		if name == "__.PKGDEF" {
 			continue
 		}
-		x := exec.Command("go", "tool", "pack", "x", a, name)
-		x.Dir, x.Env = tmp, m.env
+		x := toolCommand(m.env, "pack", "x", a, name)
+		x.Dir = tmp
 		if err := x.Run(); err != nil {
 			return err
 		}
-		d := exec.Command("go", "tool", "objdump", filepath.Join(tmp, name))
-		d.Env = m.env
+		d := toolCommand(m.env, "objdump", filepath.Join(tmp, name))
 		out, err := d.StdoutPipe()
 		if err != nil {
 			return err
@@ -316,6 +374,54 @@ func (m *machineCode) disassemble(a string, read func(io.Reader) error) error {
 		os.Remove(filepath.Join(tmp, name))
 	}
 	return nil
+}
+
+// toolBinary is a binary go tool runs, and a hash of its contents.
+type toolBinary struct{ path, id string }
+
+// toolBinaries holds the toolBinary of each tool by the environment and the
+// directory the go command runs in, which choose its toolchain.
+var toolBinaries sync.Map
+
+// tool is the binary go tool name runs under env, from the working directory, as
+// go tool -n names it; or none, when it names none.
+func tool(env []string, name string) toolBinary {
+	if env == nil {
+		env = os.Environ()
+	}
+	wd, _ := os.Getwd()
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%q", name, wd, env)
+	key := string(h.Sum(nil))
+	if b, ok := toolBinaries.Load(key); ok {
+		return b.(toolBinary)
+	}
+	var b toolBinary
+	cmd := exec.Command("go", "tool", "-n", name)
+	cmd.Env = env
+	if out, err := cmd.Output(); err == nil {
+		path := strings.TrimSpace(string(out))
+		if f, err := os.Open(path); err == nil {
+			h := sha256.New()
+			if _, err := io.Copy(h, f); err == nil {
+				b = toolBinary{path: path, id: hex.EncodeToString(h.Sum(nil))}
+			}
+			f.Close()
+		}
+	}
+	got, _ := toolBinaries.LoadOrStore(key, b)
+	return got.(toolBinary)
+}
+
+// toolCommand runs go tool name with args under env, from the binary go tool -n
+// names, which skips starting the go command for each run.
+func toolCommand(env []string, name string, args ...string) *exec.Cmd {
+	cmd := exec.Command("go", append([]string{"tool", name}, args...)...)
+	if b := tool(env, name); b.path != "" {
+		cmd = exec.Command(b.path, args...)
+	}
+	cmd.Env = env
+	return cmd
 }
 
 // machineName is a symbol without the suffixes that name its ABI.
@@ -509,11 +615,14 @@ func newCodeReader() *codeReader {
 	return &codeReader{index: make(codeIndex, codeIndexWords), read: map[string]bool{}, spill: &spillFile{}}
 }
 
-// codeScan is a codeReader's place in one package's code.
+// codeScan is a place in one package's code, read for reader and out, either of
+// which can be nil.
 type codeScan struct {
 	reader *codeReader
 	path   string
 	sym    string
+	out    *archiveWriter
+	last   string // the position last recorded to out
 }
 
 // conversionCalls are the runtime functions that make a conversion or a
@@ -541,7 +650,13 @@ func (s *codeScan) line(l string) {
 	if !ok {
 		return
 	}
-	s.reader.index.add(s.path + "\x00" + pos)
+	if s.reader != nil {
+		s.reader.addLine(s.path, pos)
+	}
+	if s.out != nil && pos != s.last {
+		s.out.record('L', pos)
+		s.last = pos
+	}
 	if !strings.Contains(instr, "runtime.") {
 		return
 	}
@@ -549,20 +664,35 @@ func (s *codeScan) line(l string) {
 	if m == nil || !allocatingRuntime.MatchString(m[1]) {
 		return
 	}
-	line, err := strconv.Atoi(lineText)
-	if err != nil {
+	if _, err := strconv.Atoi(lineText); err != nil {
 		return
 	}
-	s.reader.spill.write(s.sym, file, lineText, m[1])
-	if !conversionCalls.MatchString(m[1]) {
+	if s.reader != nil {
+		s.reader.addCall(s.path, s.sym, file, lineText, m[1])
+	}
+	s.out.record('C', s.sym, file, lineText, m[1])
+}
+
+// addLine notes that the code of package path has code at pos, a file:line.
+func (r *codeReader) addLine(path, pos string) {
+	r.index.add(path + "\x00" + pos)
+}
+
+// addCall notes a call to runtime, a function that can allocate, by sym of
+// package path at file:lineText.
+func (r *codeReader) addCall(path, sym, file, lineText, runtime string) {
+	r.spill.write(sym, file, lineText, runtime)
+	if !conversionCalls.MatchString(runtime) {
 		return
 	}
+	line, _ := strconv.Atoi(lineText)
 	if testHookCodeCall != nil {
-		if line, ok = testHookCodeCall(s.sym, file, line, m[1]); !ok {
+		var ok bool
+		if line, ok = testHookCodeCall(sym, file, line, runtime); !ok {
 			return
 		}
 	}
-	s.reader.index.add(callKey(s.path, file, line, m[1]))
+	r.index.add(callKey(path, file, line, runtime))
 }
 
 func callKey(path, file string, line int, runtime string) string {
@@ -634,26 +764,7 @@ func (f *spillFile) close() {
 // lines has the code reader read the archive of package path, when nothing
 // has yet.
 func (m *machineCode) lines(path string) {
-	if m.code.read[path] {
-		return
-	}
-	m.code.read[path] = true
-	a, ok := m.archives[path]
-	if !ok {
-		return
-	}
-	read := func(r io.Reader) error {
-		code := &codeScan{reader: m.code, path: path}
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1<<20), 1<<20)
-		for sc.Scan() {
-			code.line(sc.Text())
-		}
-		return sc.Err()
-	}
-	if err := m.disassemble(a, read); err != nil && m.err == nil {
-		m.err = err
-	}
+	m.load(path)
 }
 
 // withoutCopy reports whether the code of package path compiles the function on
@@ -674,4 +785,294 @@ func (m *machineCode) withoutCopy(path, file string, from, to int, body [2]int, 
 		}
 	}
 	return false
+}
+
+// archiveCacheBytes bounds the archive cache. A check that writes to it first
+// removes the entries used longest ago until those left fit, so the directory
+// holds at most this and what the checks running since have written.
+const archiveCacheBytes = 256 << 20
+
+// machineRules is ruleHash, which an archive's reading depends on.
+var machineRules = sync.OnceValue(ruleHash)
+
+// cacheDir is the directory checks under cfg keep what they work out in.
+func cacheDir(cfg Config) (string, error) {
+	if cfg.SummaryCache != "" {
+		return cfg.SummaryCache, nil
+	}
+	if testSummaryCache != "" {
+		return testSummaryCache, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "noalloc"), nil
+}
+
+// machineCacheDir is the directory of the archive cache of checks under cfg, or
+// "" for none.
+func machineCacheDir(cfg Config) string {
+	dir, err := cacheDir(cfg)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "machine")
+}
+
+// archiveEntry is where the archive cache keeps the reading of one archive: what
+// its code does and which of its lines hold code, never what is judged of it,
+// which depends on the allowlist. A file holds the entry of one key.
+type archiveEntry struct {
+	m         *machineCode
+	key, file string
+}
+
+// archiveHeader starts each file of the archive cache, followed by its key.
+const archiveHeader = "noalloc archive reading"
+
+// archiveCache is m's entry for archive a of package path, keyed by a's
+// contents, the objdump that reads it, and the rules it is read by. It names no
+// file when m keeps no cache, or go names no objdump.
+func (m *machineCode) archiveCache(path, a string) archiveEntry {
+	if m.cache == "" {
+		return archiveEntry{}
+	}
+	od := tool(m.env, "objdump")
+	if od.id == "" {
+		return archiveEntry{}
+	}
+	f, err := os.Open(a)
+	if err != nil {
+		return archiveEntry{}
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return archiveEntry{}
+	}
+	k := sha256.New()
+	fmt.Fprintf(k, "%s\n%s\n%s\n%x\n", machineRules(), od.id, path, h.Sum(nil))
+	key := hex.EncodeToString(k.Sum(nil))
+	return archiveEntry{m: m, key: key, file: filepath.Join(m.cache, key+".code")}
+}
+
+// replay reads e's file, the archive of package path: its functions into t,
+// unless t is nil, its lines into code, unless code is nil, and its functions
+// that never return into e.m. It reports whether the file held the whole entry.
+// One that did not can have added some of it, which a reading of the archive
+// adds again.
+func (e archiveEntry) replay(path string, t map[string]textSym, code *codeReader) bool {
+	f, err := os.Open(e.file)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	m := e.m
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	if !sc.Scan() || sc.Text() != archiveHeader+"\t"+e.key {
+		return false
+	}
+	var cur string
+	var s textSym
+	flush := func() {
+		if cur != "" {
+			t[cur] = s
+		}
+	}
+	for sc.Scan() {
+		kind, rest, _ := strings.Cut(sc.Text(), "\t")
+		switch kind {
+		case "L":
+			if code != nil {
+				code.addLine(path, rest)
+			}
+		case "C":
+			f := strings.Split(rest, "\t")
+			if len(f) != 4 {
+				return false
+			}
+			if code != nil {
+				code.addCall(path, f[0], f[1], f[2], f[3])
+			}
+		case "N":
+			m.noReturn[m.intern(rest)] = true
+		case "T":
+			if t == nil {
+				continue
+			}
+			flush()
+			name, flags, _ := strings.Cut(rest, "\t")
+			cur = m.intern(name)
+			s = textSym{indirect: strings.Contains(flags, "i"), vdso: strings.Contains(flags, "v"), ret: strings.Contains(flags, "r")}
+		case "c", "j", "k":
+			if t == nil {
+				continue
+			}
+			if cur == "" {
+				return false
+			}
+			to := m.intern(rest)
+			switch kind {
+			case "c":
+				s.targets = append(s.targets, to)
+			case "j":
+				s.tails = append(s.tails, to)
+			default:
+				s.closures = append(s.closures, to)
+			}
+		case "E":
+			if t != nil {
+				flush()
+			}
+			now := time.Now()
+			os.Chtimes(e.file, now, now)
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// archiveWriter writes an entry of the archive cache as the archive is read,
+// holding no more of it than a buffer.
+type archiveWriter struct {
+	e   archiveEntry
+	f   *os.File
+	out *bufio.Writer
+	err error
+}
+
+// create starts writing e, or returns nil when e names no file or it cannot be
+// written. The cache is only ever a shortcut: failing to write it leaves the
+// check to read the archive again next time.
+func (e archiveEntry) create() *archiveWriter {
+	if e.file == "" {
+		return nil
+	}
+	dir := filepath.Dir(e.file)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil
+	}
+	f, err := os.CreateTemp(dir, e.key+".*.tmp")
+	if err != nil {
+		return nil
+	}
+	w := &archiveWriter{e: e, f: f, out: bufio.NewWriterSize(f, 64<<10)}
+	_, w.err = w.out.WriteString(archiveHeader + "\t" + e.key + "\n")
+	return w
+}
+
+// record writes a line of kind and fields. A field a line cannot hold leaves
+// the entry unwritten.
+func (w *archiveWriter) record(kind byte, fields ...string) {
+	if w == nil || w.err != nil {
+		return
+	}
+	w.out.WriteByte(kind)
+	for _, s := range fields {
+		if strings.ContainsAny(s, "\t\n") {
+			w.err = fmt.Errorf("a field of %c holds a tab or a newline", kind)
+			return
+		}
+		w.out.WriteByte('\t')
+		w.out.WriteString(s)
+	}
+	_, w.err = w.out.WriteString("\n")
+}
+
+// abort removes what w wrote.
+func (w *archiveWriter) abort() {
+	if w == nil {
+		return
+	}
+	w.f.Close()
+	os.Remove(w.f.Name())
+}
+
+// commit writes t, the archive's functions, and renames the entry into place,
+// so that checks writing at once leave one whole file.
+func (w *archiveWriter) commit(t map[string]textSym) {
+	if w == nil {
+		return
+	}
+	for _, name := range slices.Sorted(maps.Keys(t)) {
+		s := t[name]
+		var flags []byte
+		for _, f := range []struct {
+			set bool
+			c   byte
+		}{{s.indirect, 'i'}, {s.vdso, 'v'}, {s.ret, 'r'}} {
+			if f.set {
+				flags = append(flags, f.c)
+			}
+		}
+		w.record('T', name, string(flags))
+		for _, list := range []struct {
+			kind byte
+			syms []string
+		}{{'c', s.targets}, {'j', s.tails}, {'k', s.closures}} {
+			for _, sym := range list.syms {
+				w.record(list.kind, sym)
+			}
+		}
+	}
+	w.record('E')
+	if w.err == nil {
+		w.err = w.out.Flush()
+	}
+	if err := w.f.Close(); w.err == nil {
+		w.err = err
+	}
+	if w.err == nil {
+		w.err = os.Rename(w.f.Name(), w.e.file)
+	}
+	if w.err != nil {
+		os.Remove(w.f.Name())
+		return
+	}
+	if m := w.e.m; !m.pruned {
+		m.pruned = true
+		pruneArchiveCache(filepath.Dir(w.e.file), archiveCacheBytes)
+	}
+}
+
+// pruneArchiveCache removes the entries of dir used longest ago until those left
+// hold at most limit bytes, and any entry still unfinished after an hour.
+func pruneArchiveCache(dir string, limit int64) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type entry struct {
+		name string
+		size int64
+		used time.Time
+	}
+	var kept []entry
+	var total int64
+	for _, d := range entries {
+		info, err := d.Info()
+		if err != nil {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(d.Name(), ".tmp") && time.Since(info.ModTime()) > time.Hour:
+			os.Remove(filepath.Join(dir, d.Name()))
+		case strings.HasSuffix(d.Name(), ".code"):
+			kept = append(kept, entry{d.Name(), info.Size(), info.ModTime()})
+			total += info.Size()
+		}
+	}
+	slices.SortFunc(kept, func(a, b entry) int { return a.used.Compare(b.used) })
+	for _, e := range kept {
+		if total <= limit {
+			break
+		}
+		if os.Remove(filepath.Join(dir, e.name)) == nil {
+			total -= e.size
+		}
+	}
 }

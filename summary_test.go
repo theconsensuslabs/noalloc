@@ -139,10 +139,10 @@ func TestSummariesAreCached(t *testing.T) {
 	}
 }
 
-// TestTheSummaryKeyFollowsTheBuild checks that summaries are kept under a
-// key that changes with what compiles the packages outside the module, the
-// platform and the compiler's flags here, and not with the module's own code,
-// which summaries leave out.
+// TestTheSummaryKeyFollowsTheBuild checks that buildKey, which names the
+// summary cache file, changes with what compiles the packages outside the
+// module, the platform and the compiler's flags here, and not with the
+// module's own code. moduleKey covers the module's code inside the file.
 func TestTheSummaryKeyFollowsTheBuild(t *testing.T) {
 	dir, err := filepath.Abs("testdata/fixture")
 	if err != nil {
@@ -550,6 +550,90 @@ var quote = strconv.QuoteToASCII
 	}
 }
 
+// TestACachedSummaryFollowsTheModuleCodeItRuns checks that a summary cached by
+// one check is not read by a later check of changed module code the summary
+// depends on: what the module hands an outside function to call, a function or
+// closure of the module an outside function calls back into, a method it
+// calls, and an exemption in that callback. The check after the change must
+// find what a check with an empty cache finds, and that must differ from what
+// the code before the change found.
+func TestACachedSummaryFollowsTheModuleCodeItRuns(t *testing.T) {
+	const sortRows = "type row struct{ a, b int }\n\n//noalloc:root\nfunc Root(xs []row) { slices.SortFunc(xs, byA) }\n\n"
+	const appendRow = "\tseen = append(seen, x)"
+	for _, c := range []struct {
+		name          string
+		before, after string
+	}{
+		{"the module hands an outside function an allocating callback",
+			"func work() {}\n\n//noalloc:root\nfunc Root() { codedep.Apply(work) }\n",
+			"//noalloc:root\nfunc Root() { codedep.Apply(codedep.Grow) }\n"},
+		{"the module swaps one outside callback for an allocating one",
+			"//noalloc:root\nfunc Root() { codedep.Apply(codedep.Quiet) }\n",
+			"//noalloc:root\nfunc Root() { codedep.Apply(codedep.Grow) }\n"},
+		{"the module hands an outside function an allocating implementation",
+			"type quiet struct{}\n\nfunc (quiet) Do() {}\n\n//noalloc:root\nfunc Root() { codedep.Run(quiet{}) }\n",
+			"//noalloc:root\nfunc Root() { codedep.Run(codedep.Grower{}) }\n"},
+		{"a callback starts allocating",
+			sortRows + "func byA(x, y row) int { return cmp.Compare(x.a, y.a) }\n",
+			sortRows + "var seen []row\n\nfunc byA(x, y row) int {\n" + appendRow + "\n\treturn cmp.Compare(x.a, y.a)\n}\n"},
+		{"a closure literal starts allocating",
+			"type row struct{ a, b int }\n\n//noalloc:root\nfunc Root(xs []row) {\n\tslices.SortFunc(xs, func(x, y row) int { return cmp.Compare(x.a, y.a) })\n}\n",
+			"type row struct{ a, b int }\n\nvar seen []row\n\n//noalloc:root\nfunc Root(xs []row) {\n\tslices.SortFunc(xs, func(x, y row) int {\n\t" + appendRow + "\n\t\treturn cmp.Compare(x.a, y.a)\n\t})\n}\n"},
+		{"a method an outside function calls stops allocating",
+			"type rows []int\n\nvar seen []int\n\nfunc (r rows) Len() int { return len(r) }\nfunc (r rows) Less(i, j int) bool {\n\tseen = append(seen, r[i])\n\treturn r[i] < r[j]\n}\nfunc (r rows) Swap(i, j int) { r[i], r[j] = r[j], r[i] }\n\n//noalloc:root\nfunc Root(xs []int) { sort.Sort(rows(xs)) }\n",
+			"type rows []int\n\nfunc (r rows) Len() int           { return len(r) }\nfunc (r rows) Less(i, j int) bool { return r[i] < r[j] }\nfunc (r rows) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }\n\n//noalloc:root\nfunc Root(xs []int) { sort.Sort(rows(xs)) }\n"},
+		{"an exemption in a callback is removed",
+			sortRows + "var seen []row\n\nfunc byA(x, y row) int {\n" + appendRow + " //noalloc:exempt the test's own sink\n\treturn cmp.Compare(x.a, y.a)\n}\n",
+			sortRows + "var seen []row\n\nfunc byA(x, y row) int {\n" + appendRow + "\n\treturn cmp.Compare(x.a, y.a)\n}\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			warm := t.TempDir()
+			before := cachedCallers(t, dir, warm, c.before)
+			got := cachedCallers(t, dir, warm, c.after)
+			want := cachedCallers(t, dir, t.TempDir(), c.after)
+			if slices.Equal(before, want) {
+				t.Fatalf("control: the change leaves the findings as they were: %q", want)
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("with the summaries the old code cached, the changed code finds\n%q\nwant, as with an empty cache,\n%q", got, want)
+			}
+			if files, _ := filepath.Glob(filepath.Join(warm, "summaries-*.json")); len(files) != 1 {
+				t.Errorf("the cache holds %d files after the change, want the one it was saved to: %q", len(files), files)
+			}
+		})
+	}
+}
+
+// cachedCallers checks callers, a module whose one file is src, beside a
+// dependency whose Apply and Run call what they are handed, with summaries
+// cached in cache. It returns each finding and each exemption's cover, sorted.
+func cachedCallers(t *testing.T, dir, cache, src string) []string {
+	t.Helper()
+	writeConversionFile(t, dir, "go.mod", "module callers\n\ngo 1.27\n\nrequire codedep v0.0.0\n\nreplace codedep => ./dep\n")
+	writeConversionFile(t, dir, "callers.go", "package callers\n\nimport (\n\t\"cmp\"\n\t\"slices\"\n\t\"sort\"\n\n\t\"codedep\"\n)\n\n"+
+		"var _, _, _, _ = cmp.Compare[int], slices.Max[[]int], sort.Ints, codedep.Grow\n\n"+src)
+	dep := filepath.Join(dir, "dep")
+	writeConversionFile(t, dep, "go.mod", "module codedep\n\ngo 1.27\n")
+	writeConversionFile(t, dep, "dep.go", "package codedep\n\nvar grown []int\n\n"+
+		"//go:noinline\nfunc Apply(f func()) { f() }\n\n//go:noinline\nfunc Run(r interface{ Do() }) { r.Do() }\n\n"+
+		"func Grow() { grown = append(grown, 1) }\n\nfunc Quiet() {}\n\ntype Grower struct{}\n\nfunc (Grower) Do() { Grow() }\n")
+	res, err := Check(Config{Dir: dir, Patterns: []string{"."}, Module: "callers", Env: append(os.Environ(), "GOFLAGS=", "GOWORK=off"),
+		Allow: strings.Split(Allowlist, "\n"), Root: dir, SummaryCache: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, f := range res.Findings {
+		out = append(out, f.Func+" | "+f.Source+" | "+strings.Join(f.Reasons, ", "))
+	}
+	for _, e := range res.Exemptions {
+		out = append(out, "exemption in "+e.Func+" covers "+strings.Join(e.Covers, ", "))
+	}
+	slices.Sort(out)
+	return out
+}
+
 // TestChecksSavingAtOnceLeaveAWholeCache checks that saves of one build's
 // summaries at once all succeed and leave a file that parses.
 func TestChecksSavingAtOnceLeaveAWholeCache(t *testing.T) {
@@ -558,7 +642,7 @@ func TestChecksSavingAtOnceLeaveAWholeCache(t *testing.T) {
 	errs := make(chan error, 16)
 	for i := range 16 {
 		go func() {
-			c, err := openSummaryCache(Config{SummaryCache: dir}, key)
+			c, err := openSummaryCache(Config{SummaryCache: dir}, key, "m")
 			if err == nil {
 				c.put(strconv.Itoa(i), summary{Shaped: true})
 				err = c.save()
@@ -571,7 +655,7 @@ func TestChecksSavingAtOnceLeaveAWholeCache(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	c, err := openSummaryCache(Config{SummaryCache: dir}, key)
+	c, err := openSummaryCache(Config{SummaryCache: dir}, key, "m")
 	if err != nil {
 		t.Fatal(err)
 	}

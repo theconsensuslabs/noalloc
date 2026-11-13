@@ -261,7 +261,7 @@ func TestAnArchiveShowsTheCallsTheCompilerWrites(t *testing.T) {
 			a := &asmReader{}
 			defer a.close()
 			for _, l := range strings.Split(string(out), "\n") {
-				a.line(l)
+				a.line([]byte(l))
 			}
 			fromCompiler := map[string]bool{}
 			if err := a.each(func(rc runtimeCall) {
@@ -362,7 +362,7 @@ func TestTheCodeReadersHoldAFixedAmount(t *testing.T) {
 			read: func(t *testing.T, lines []string) (any, func() int, func()) {
 				a := &asmReader{}
 				for _, l := range lines {
-					a.line(l)
+					a.line([]byte(l))
 				}
 				return a, func() int {
 					calls := 0

@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -106,7 +107,8 @@ func listPackages(dir string, env, args []string) ([]buildPackage, error) {
 // they are worked out by, which packages are the module's, the functions
 // labeled to allocate nothing, and every package outside the module, by the
 // action ID that changes with its source, its imports, the toolchain, the
-// platform, and the flags, tags, and profile it is compiled with.
+// platform, and the flags, tags, and profile it is compiled with. It names the
+// cache file; moduleKey, kept inside the file, covers the module's own code.
 func buildKey(cfg Config, pkgs []buildPackage, assumed map[string]string) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n%s\n%q\n", summaryFormat, ruleHash(), append([]string{cfg.Module}, cfg.SourceModules...))
@@ -116,9 +118,25 @@ func buildKey(cfg Config, pkgs []buildPackage, assumed map[string]string) string
 	}
 	slices.Sort(labels)
 	fmt.Fprintf(h, "%q\n", labels)
+	hashPackages(h, cfg, pkgs, false)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// moduleKey hashes the module's own packages by their action IDs. A summary
+// depends on module code too: what the module hands a function outside it to
+// call decides what that function's indirect calls reach.
+func moduleKey(cfg Config, pkgs []buildPackage) string {
+	h := sha256.New()
+	hashPackages(h, cfg, pkgs, true)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// hashPackages writes to h a sorted "path actionID" line for each of pkgs
+// that is in cfg's module when inModule is true, and outside it when false.
+func hashPackages(h io.Writer, cfg Config, pkgs []buildPackage, inModule bool) {
 	var lines []string
 	for _, p := range pkgs {
-		if !cfg.inModule(p.path) {
+		if cfg.inModule(p.path) == inModule {
 			lines = append(lines, p.path+" "+p.actionID)
 		}
 	}
@@ -126,5 +144,4 @@ func buildKey(cfg Config, pkgs []buildPackage, assumed map[string]string) string
 	for _, l := range lines {
 		fmt.Fprintln(h, l)
 	}
-	return hex.EncodeToString(h.Sum(nil))
 }

@@ -1,6 +1,7 @@
 package noalloc
 
 import (
+	"bytes"
 	"fmt"
 	"go/types"
 	"regexp"
@@ -489,27 +490,35 @@ type asmPos struct {
 
 var asmPosition = regexp.MustCompile(`^\t0x[0-9a-f]+ \d+ \((/.+\.go):(\d+)\)\t`)
 
-func (a *asmReader) line(l string) {
-	if l == "" {
+var (
+	stextMark  = []byte(" STEXT")
+	goLineMark = []byte(".go:")
+	callMark   = []byte("\tCALL\truntime.")
+)
+
+// line reads one line of the compiler's -S output. It runs a pattern only on
+// a line holding that pattern's literal text, and copies only what it keeps.
+func (a *asmReader) line(l []byte) {
+	if len(l) == 0 {
 		return
 	}
 	if l[0] != '\t' && l[0] != ' ' {
-		if i := strings.Index(l, " STEXT"); i > 0 {
-			a.symbol, a.started = l[:i], false
+		if i := bytes.Index(l, stextMark); i > 0 {
+			a.symbol, a.started = string(l[:i]), false
 		}
 		return
 	}
-	if !a.started {
-		if m := asmPosition.FindStringSubmatch(l); m != nil {
+	if !a.started && bytes.Contains(l, goLineMark) {
+		if m := asmPosition.FindSubmatch(l); m != nil {
 			a.started = true
-			a.spill.write(a.symbol, m[1], m[2], "")
+			a.spill.write(a.symbol, string(m[1]), string(m[2]), "")
 		}
 	}
-	if !strings.Contains(l, "\tCALL\truntime.") {
+	if !bytes.Contains(l, callMark) {
 		return
 	}
-	if m := asmCall.FindStringSubmatch(l); m != nil {
-		a.spill.write(a.symbol, m[1], m[2], m[3])
+	if m := asmCall.FindSubmatch(l); m != nil {
+		a.spill.write(a.symbol, string(m[1]), string(m[2]), string(m[3]))
 	}
 }
 
