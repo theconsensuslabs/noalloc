@@ -37,7 +37,7 @@ func (c *Classes[T]) grow(r *Region, have, need int) ([]T, *Pool[T]) {
 		if l := p.ChunkLen(); l <= have || l < need {
 			continue
 		}
-		if mem := Take(r, p); mem != nil {
+		if mem := r.Take(p); mem != nil {
 			return mem, p
 		}
 	}
@@ -110,7 +110,7 @@ func (s *Slice[T]) room(n int) bool {
 	}
 	k := copy(mem, s.items)
 	if s.p != nil {
-		GiveBack(s.r, s.p, s.items[:cap(s.items)])
+		s.r.GiveBack(s.p, s.items[:cap(s.items)])
 	}
 	s.items, s.p, s.gen = mem[:k], p, s.r.gen
 	return true

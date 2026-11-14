@@ -83,7 +83,7 @@ func (v *Vec[T]) Push(x T) bool {
 		v.at++
 	}
 	if v.r != nil && v.k < vecChunks {
-		if c := Take(v.r, v.p); c != nil {
+		if c := v.r.Take(v.p); c != nil {
 			c = c[:1]
 			c[0] = x
 			v.chunks[v.k] = c
@@ -169,7 +169,7 @@ func (v *Vec[T]) Extend(xs []T) bool {
 		if v.r == nil || v.k == vecChunks {
 			break
 		}
-		c := Take(v.r, v.p)
+		c := v.r.Take(v.p)
 		if c == nil {
 			break
 		}

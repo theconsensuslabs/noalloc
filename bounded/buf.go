@@ -55,7 +55,7 @@ func (b *Buf) Reset(mem []byte, flush io.Writer) {
 //
 //noalloc:root
 func (b *Buf) ResetFrom(r *Region, p *Pool[byte], flush io.Writer) bool {
-	mem := Take(r, p)
+	mem := r.Take(p)
 	b.Reset(mem, flush)
 	b.full = mem == nil
 	if mem != nil {
@@ -86,7 +86,7 @@ func (b *Buf) move(k int) bool {
 	}
 	copy(mem, b.mem[:b.n])
 	if b.p != nil && b.pin == 0 {
-		GiveBack(b.r, b.p, b.mem)
+		b.r.GiveBack(b.p, b.mem)
 	}
 	b.mem, b.p = mem, p
 	return true

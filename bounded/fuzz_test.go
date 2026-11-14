@@ -93,7 +93,8 @@ func FuzzMapMatchesAGoMap(f *testing.F) {
 // and truncate, and to a model slice of at most capacity items, calling
 // check after each.
 func listOps(t *testing.T, data []byte, capacity int, push func(uint16) bool, extend func([]uint16) bool,
-	truncate func(int), check func(step int, model []uint16, full bool)) {
+	truncate func(int), check func(step int, model []uint16, full bool),
+) {
 	t.Helper()
 	var model []uint16
 	full := false
@@ -250,7 +251,7 @@ func FuzzRegionsShareAPool(f *testing.F) {
 			r, m := &regions[i], &ms[i]
 			switch op {
 			case 0:
-				got := Take(r, p)
+				got := r.Take(p)
 				switch {
 				case m.spares > 0:
 					if got == nil {
@@ -277,7 +278,7 @@ func FuzzRegionsShareAPool(f *testing.F) {
 					continue
 				}
 				k := m.spares + n%(len(m.held)-m.spares)
-				GiveBack(r, p, m.held[k])
+				r.GiveBack(p, m.held[k])
 				m.held = slices.Delete(m.held, k, k+1)
 				free++
 			case 2:
@@ -285,7 +286,7 @@ func FuzzRegionsShareAPool(f *testing.F) {
 				done := make(chan struct{})
 				close(done)
 				fits := (len(m.held)+k)*chunkBytes <= m.budget && k <= free
-				if got := Reserve(done, r, p, k); got != fits {
+				if got := r.Reserve(done, p, k); got != fits {
 					t.Fatalf("step %d: Reserve(%d) = %v, model %v", step, k, got, fits)
 				}
 				if fits {
